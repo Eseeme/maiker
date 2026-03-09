@@ -1,0 +1,64 @@
+project:
+  name: my-product
+  root: .
+  framework: auto
+  package_manager: auto
+
+models:
+  research_ingestion:
+    provider: gemini
+    model: gemini-2.5-pro
+  planner:
+    provider: openai
+    model: gpt-5.4-thinking
+  code_generation:
+    provider: claude
+    model: claude-code-sonnet
+  repair_agent:
+    provider: claude
+    model: claude-code-sonnet
+  visual_review:
+    provider: openai
+    model: gpt-4o
+  post_approval_review:
+    provider: claude
+    model: claude-code-sonnet
+
+validators:
+  install: true
+  build: true
+  lint: true
+  typecheck: true
+  unit_tests: true
+  integration_tests: false
+  playwright_e2e: true
+  screenshot_capture: true
+  visual_review: true
+  ux_rules: true
+
+playwright:
+  base_url: http://localhost:3000
+  viewports:
+    - [320, 568]
+    - [375, 667]
+    - [390, 844]
+    - [414, 896]
+    - [768, 1024]
+  routes:
+    - /
+    - /dashboard
+    - /settings
+
+policies:
+  require_human_approval: true
+  post_approval_review_required: true
+  max_auto_repairs_per_issue: 3
+  max_auto_repairs_per_run: 6
+  max_visual_retries: 2
+  stop_on_build_failure: false
+
+artifacts:
+  output_dir: .maiker/runs
+  save_screenshots: true
+  save_playwright_trace: true
+  save_diff_reports: true

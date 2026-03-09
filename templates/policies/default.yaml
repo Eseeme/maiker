@@ -1,0 +1,23 @@
+# Default mAIker Policy
+
+repair_policy:
+  max_auto_repairs_per_issue: 3
+  max_auto_repairs_per_run: 6
+  max_visual_retries: 2
+  escalate_on_same_failure_pattern: true
+
+context_policy:
+  low_impact: continue_current_stage
+  medium_impact: rerun_current_stage
+  high_impact: replan_downstream_stages
+
+approval_policy:
+  require_human_approval: true
+  post_approval_review_required: true
+  escalation_creates_packet: true
+
+artifact_policy:
+  retain_screenshots: true
+  retain_traces: true
+  retain_diffs: true
+  retain_reports: true

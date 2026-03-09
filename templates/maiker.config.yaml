@@ -1,0 +1,89 @@
+project:
+  name: my-project
+  root: .
+  framework: auto          # auto | nextjs | react | vue | nuxt | angular | svelte | express
+  package_manager: auto    # auto | npm | yarn | pnpm | bun
+
+# ─── Agent Model Routing ──────────────────────────────────────────────────────
+# Each agent role has its own provider and model.
+# These are DEFAULTS — change any of them independently.
+#
+# Built-in providers:  claude | openai | gemini | pi-mono
+# You can add your own provider adapter in src/providers/ and use any name here.
+#
+# Examples of what you might use per role:
+#   research_ingestion  → gemini/gemini-2.5-pro  (good at large context ingestion)
+#   planner             → openai/o1  or  openai/gpt-4o  (strong reasoning)
+#   code_generation     → claude/claude-sonnet-4-6  or  openai/codex-mini
+#   repair_agent        → claude/claude-sonnet-4-6  (good at targeted diffs)
+#   visual_review       → openai/gpt-4o  (multimodal, good at screenshots)
+#   post_approval       → claude/claude-haiku-4-5  (fast, cheap review)
+#
+# Default: all Claude so you only need one API key to get started.
+models:
+  research_ingestion:
+    provider: claude
+    model: claude-sonnet-4-6
+  planner:
+    provider: claude
+    model: claude-sonnet-4-6
+  code_generation:
+    provider: claude
+    model: claude-sonnet-4-6
+  repair_agent:
+    provider: claude
+    model: claude-sonnet-4-6
+  visual_review:
+    provider: claude
+    model: claude-sonnet-4-6
+  post_approval_review:
+    provider: claude
+    model: claude-sonnet-4-6
+
+# ─── Validators ───────────────────────────────────────────────────────────────
+validators:
+  install: true
+  build: true
+  lint: true
+  typecheck: true
+  unit_tests: true
+  integration_tests: false
+  playwright_e2e: true
+  screenshot_capture: true
+  visual_review: true
+  ux_rules: true
+  accessibility: false
+  lockfile_sanity: false
+  regression_tests: false
+  mobile_layout_rules: false
+
+# ─── Playwright ───────────────────────────────────────────────────────────────
+playwright:
+  base_url: http://localhost:3000
+  viewports:
+    - [320, 568]
+    - [375, 667]
+    - [390, 844]
+    - [414, 896]
+    - [768, 1024]
+  routes:
+    - /
+    - /dashboard
+    - /settings
+  timeout: 30000
+
+# ─── Policies ─────────────────────────────────────────────────────────────────
+policies:
+  require_human_approval: true
+  post_approval_review_required: true
+  max_auto_repairs_per_issue: 3
+  max_auto_repairs_per_run: 6
+  max_visual_retries: 2
+  stop_on_build_failure: false
+
+# ─── Artifacts ────────────────────────────────────────────────────────────────
+artifacts:
+  output_dir: .maiker/runs
+  save_screenshots: true
+  save_playwright_trace: true
+  save_diff_reports: true
