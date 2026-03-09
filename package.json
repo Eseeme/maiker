@@ -16,13 +16,13 @@
     "clean": "rm -rf dist",
     "prebuild": "npm run clean",
     "prepare": "npm run build",
-    "link:local": "npm run build && npm link"
+    "link:local": "npm run build && npm link",
+    "setup": "npm install && npm run build && npm link && echo '\\n✓ maiker installed globally. Run: maiker --help'"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0",
     "@langchain/core": "^0.3.0",
     "@langchain/langgraph": "^0.2.0",
-    "@langchain/openai": "^0.3.0",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
     "dotenv": "^16.4.0",
@@ -52,7 +52,8 @@
     "automation",
     "code-generation",
     "playwright",
-    "langgraph"
+    "langgraph",
+    "ai-agents"
   ],
   "license": "MIT"
 }

@@ -36,133 +36,129 @@ mAIker is a **global CLI tool** you install once on your machine (like `git` or 
 After installation, you point it at **any project on your computer** and give it a goal.
 
 ```
-[maiker repo]  →  npm install + npm run build + npm link  →  maiker command available globally
+[maiker repo]  →  one command  →  maiker available globally
       ↓
-[your project]  →  maiker init  →  maiker run ./. --goal "..."
+[your project]  →  maiker init (interactive model setup)  →  maiker run . --goal "..."
 ```
-
-There is **no second terminal needed during installation**. The second terminal is only useful if you want to watch live logs while a run is executing.
 
 ---
 
-## Part 1 — Install mAIker on your machine
+## Part 1 — Install mAIker (one command)
 
 Do this **once**, inside the `maiker` repository folder (the folder you cloned).
 
-### Step 1 — Make sure you have Node.js 20+
+**Requires:** Node.js 20+ ([nodejs.org](https://nodejs.org))
+
+### Option A — One command (recommended)
 
 ```bash
-node --version
-# Should show v20.x.x or higher
-# If not: https://nodejs.org
+./scripts/bootstrap.sh
 ```
 
-### Step 2 — Install dependencies
+This does everything: checks Node version, installs dependencies, builds TypeScript, links the `maiker` command globally, and sets up `.env`.
+
+### Option B — Manual steps
+
+If you prefer to run each step yourself:
 
 ```bash
-# You are inside the maiker repo folder
-npm install
+npm run setup              # install + build + link in one command
+# OR do it step by step:
+npm install                # install dependencies
+npm run build              # compile TypeScript
+npm link                   # register maiker command globally
 ```
 
-This installs all packages listed in `package.json`. Wait for it to finish completely.
-
-### Step 3 — Build the TypeScript source
-
-```bash
-npm run build
-```
-
-This compiles all `.ts` files into `dist/`. You should see no errors.
-
-### Step 4 — Link the `maiker` command globally
-
-```bash
-npm link
-```
-
-This registers the `maiker` command on your machine globally — exactly like installing a CLI with `npm install -g`. After this, you can type `maiker` in **any terminal, any folder**.
-
-### Step 5 — Verify it works
+### Verify it works
 
 ```bash
 maiker --help
 ```
 
-You should see the full command list. If you do, installation is complete.
-
-### Optional — Install Playwright browsers (needed for E2E + screenshots)
+### Optional — Playwright browsers (for E2E + screenshots)
 
 ```bash
 ./scripts/install-playwright.sh
 ```
 
-Only needed if you want Playwright E2E testing and screenshot capture. This downloads browser binaries (Chromium by default). Takes a few minutes on first run.
-
-### Optional — Check your environment
-
-```bash
-./scripts/check-env.sh
-```
-
-Runs a full environment check: Node version, API keys, Playwright, build output, linked binary.
-
 ---
 
 ## Part 2 — Set up your API keys
 
-mAIker needs API keys to call AI models. By default, **all agent roles use Claude**, so you only need one key to get started.
-
-Create a `.env` file **inside the maiker repo folder**:
+mAIker needs API keys to call AI models. Set them in the maiker repo's `.env` file:
 
 ```bash
-# Still inside the maiker repo folder
+# Inside the maiker repo folder
 cp .env.example .env
 ```
 
-Then open `.env` and add your Anthropic key:
+Add the keys for the providers you want to use:
 
 ```bash
-# Anthropic Claude — default provider for ALL roles
-ANTHROPIC_API_KEY=sk-ant-api03-...
+ANTHROPIC_API_KEY=sk-ant-api03-...    # Claude (code, repair, review)
+OPENAI_API_KEY=sk-proj-...            # GPT-4o, o3, Codex (planning, vision)
+GOOGLE_API_KEY=AIza...                # Gemini (research, large context)
 ```
 
-That's it. All six agent roles (research, planner, coder, repair, visual review, post-approval) will use Claude by default.
-
-**Want to use other providers for specific roles?** Add their keys too:
-
-```bash
-# OpenAI — add if you route any role to openai (e.g. visual_review → openai/gpt-4o)
-OPENAI_API_KEY=sk-proj-...
-
-# Google Gemini — add if you route any role to gemini (e.g. research → gemini/gemini-2.5-pro)
-GOOGLE_API_KEY=AIza...
-```
-
-Then change the specific role in `maiker.config.yaml` — see [Model Routing](#model-routing).
+**You don't need all three.** Even a single key works — `maiker init` will detect which keys you have and pick the best model for each role automatically.
 
 ---
 
 ## Part 3 — Point mAIker at your project
 
-Now open a terminal **inside your actual project** (not the maiker repo).
+Open a terminal **inside your actual project** (not the maiker repo).
 
 ```bash
 cd /path/to/your-app
-```
-
-### Step 1 — Initialise mAIker in your project
-
-```bash
 maiker init
 ```
 
-This creates a `.maiker/` folder inside your project and generates a `maiker.config.yaml` config file. It does not touch any of your source code.
+### What `maiker init` does (interactive)
 
-Your project folder will now look like:
+1. **Detects your API keys** — scans environment for `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`
+2. **Validates keys work** — makes a test call to each provider
+3. **Recommends the best model for each role** based on what's available:
+
+```
+  Detected API keys:
+
+    claude     ANTHROPIC_API_KEY        ✓ found
+    openai     OPENAI_API_KEY           ✓ found
+    gemini     GOOGLE_API_KEY           ✗ not set
+
+  Recommended model routing:
+
+    Research ingestion       claude  claude-sonnet-4-6       (reasoning, code, analysis)
+    Planner                  openai  o3                      (reasoning, planning)
+    Code generation          claude  claude-sonnet-4-6       (code, analysis)
+    Repair                   claude  claude-sonnet-4-6       (code, repair)
+    Visual review            openai  gpt-4o                  (vision)
+    Post-approval review     claude  claude-haiku-4-5        (fast, cheap, review)
+
+  Use these models? [Y/n]
+```
+
+4. **Writes `maiker.config.yaml`** with the selected models
+5. **Creates `.maiker/` folder** for run outputs
+
+The recommendation engine scores every model against each role's needs:
+
+| Role | What it needs | Best fit examples |
+|------|--------------|-------------------|
+| Research | Large context, reasoning | Gemini 2.5 Pro (1M ctx), Claude Opus |
+| Planner | Reasoning, planning | o3, Claude Opus |
+| Code generation | Code quality | Claude Sonnet, Codex Mini |
+| Repair | Code + analysis | Claude Sonnet |
+| Visual review | Multimodal/vision | GPT-4o, Claude Sonnet |
+| Post-approval | Fast review (cost-sensitive) | Claude Haiku, GPT-4o Mini |
+
+You can always change models later in `maiker.config.yaml`. Skip interactive setup with `maiker init --skip-setup`.
+
+### After init
 
 ```
 your-app/
-├── maiker.config.yaml    ← created by maiker init
+├── maiker.config.yaml    ← created by maiker init (with your model choices)
 ├── .maiker/              ← created by maiker init
 │   └── runs/             ← run outputs will go here
 ├── src/
@@ -170,33 +166,13 @@ your-app/
 └── ...your files...
 ```
 
-### Step 2 — Edit the config (optional for first run)
-
-```bash
-# Open maiker.config.yaml in your editor
-# The defaults work for most projects
-```
-
-The key settings most people change:
-
-```yaml
-playwright:
-  base_url: http://localhost:3000   # change to match your dev server port
-  routes:
-    - /
-    - /dashboard                    # add your actual routes here
-
-policies:
-  require_human_approval: false     # set to false to skip manual approval step
-```
-
-### Step 3 — Inspect your project (optional but recommended)
+### Inspect your project (optional but recommended)
 
 ```bash
 maiker inspect .
 ```
 
-This scans your project and shows what mAIker detected: framework, package manager, routes, test setup. Good way to confirm everything is recognised correctly before running.
+Scans your project and shows what mAIker detected: framework, package manager, routes, test setup.
 
 ---
 
@@ -247,17 +223,20 @@ If mAIker can't auto-repair an issue after the retry limit, it pauses and writes
 .maiker/runs/<run-id>/review/human-review.md
 ```
 
-Open that file, read the summary, then resume:
+Open that file, read the summary, then resume with a decision:
 
 ```bash
-maiker resume --run-id <the-run-id-shown>
+maiker resume --run-id <the-run-id-shown>                    # interactive prompt
+maiker resume --run-id <the-run-id-shown> --decision proceed # continue from where it stopped
+maiker resume --run-id <the-run-id-shown> --decision replan  # go back to PLAN stage
+maiker resume --run-id <the-run-id-shown> --decision abort   # stop the run
 ```
 
 ---
 
 ## Pre-flight Confirmation
 
-Before every run, mAIker shows a **pre-flight screen** so you can verify which models will be used for each step:
+Before every run, mAIker shows a **pre-flight screen** that validates your setup and shows exactly which models will be used:
 
 ```
   Pre-flight check
@@ -269,12 +248,12 @@ Before every run, mAIker shows a **pre-flight screen** so you can verify which m
 
   Agent Model Routing
 
-  Research ingestion     claude  claude-sonnet-4-6
-  Planner                claude  claude-sonnet-4-6
-  Code generation        claude  claude-sonnet-4-6
-  Repair                 claude  claude-sonnet-4-6
-  Visual review          claude  claude-sonnet-4-6
-  Post-approval review   claude  claude-sonnet-4-6
+  Research ingestion     claude  claude-sonnet-4-6       (reasoning, code, analysis)
+  Planner                openai  o3                      (reasoning, planning)
+  Code generation        claude  claude-sonnet-4-6       (code, analysis)
+  Repair                 claude  claude-sonnet-4-6       (code, repair)
+  Visual review          openai  gpt-4o                  (vision)
+  Post-approval review   claude  claude-haiku-4-5        (fast, cheap, review)
 
   Validators
 
@@ -286,16 +265,33 @@ Before every run, mAIker shows a **pre-flight screen** so you can verify which m
 
   Max repairs / issue:  3
   Max repairs / run:    6
+  Auto-replan at:       50% budget exhausted
   Human approval:       required
   Post-approval review: enabled
-
-  To change any model: edit maiker.config.yaml → models section
-  To skip this check:  add --yes to the run command
 
   Proceed with these settings? [Y/n]
 ```
 
-Press Enter (or `y`) to proceed, or `n` to abort and edit your config first. In CI/non-TTY environments, it defaults to yes automatically.
+### Key validation
+
+If a configured provider is missing its API key, pre-flight **blocks the run** and suggests alternatives:
+
+```
+  ⚠ Missing API keys
+
+    ✗ gemini: GOOGLE_API_KEY not set
+      Affects: Research ingestion
+
+  Suggested fix: switch missing roles to available providers:
+
+    Research ingestion       → claude  claude-sonnet-4-6  (reasoning, code, analysis)
+
+  Edit maiker.config.yaml to apply, or add the missing keys to .env
+
+  Cannot proceed: missing API keys for configured providers.
+```
+
+Press Enter to proceed, or `n` to abort. In CI/non-TTY environments, defaults to yes (but still blocks on missing keys).
 
 ---
 
@@ -457,7 +453,13 @@ maiker context add --message "Do not modify the desktop navigation bar"
 maiker context add --message "The /settings route is not important, focus on /dashboard"
 ```
 
-mAIker analyses the impact and either continues, reruns the current stage, or replans — all without stopping.
+mAIker analyses the impact and decides what to do based on the **impact level**:
+
+| Impact | Action | When |
+|--------|--------|------|
+| `low` | `continue` — no change to the running workflow | Minor clarifications, style preferences |
+| `medium` | `rerun_current_stage` — reruns the stage in progress | New constraints that affect current work |
+| `high` | `replan_downstream` — goes back to PLAN and replans remaining work | Fundamental changes to requirements |
 
 ---
 
@@ -483,6 +485,7 @@ mAIker analyses the impact and either continues, reruns the current stage, or re
 | Command | What it does |
 |---------|-------------|
 | `maiker run <path> --goal "..."` | Runs the full workflow end to end |
+| `maiker run <path> --goal "..." --dry-run` | Plans only — generates plan then stops (no code changes) |
 | `maiker run <path> --goal "..." --yes` | Runs without pre-flight confirmation |
 | `maiker validate <path>` | Runs validators only (no code changes) |
 | `maiker repair <path> --run-id <id>` | Applies targeted repairs from an existing issue list |
@@ -500,6 +503,7 @@ mAIker analyses the impact and either continues, reruns the current stage, or re
 | `maiker logs --run-id <id> --follow` | Tails log for a specific run |
 | `maiker artifacts list` | Lists all artifacts for the most recent run |
 | `maiker artifacts list --run-id <id>` | Lists artifacts for a specific run |
+| `maiker artifacts list --category <name>` | Filter by category: screenshots, traces, logs, diffs, reports |
 
 ### Control
 
@@ -507,8 +511,9 @@ mAIker analyses the impact and either continues, reruns the current stage, or re
 |---------|-------------|
 | `maiker pause` | Pauses the current run at the next safe checkpoint |
 | `maiker pause --run-id <id>` | Pauses a specific run |
-| `maiker resume` | Resumes the most recently paused run |
+| `maiker resume` | Resumes the most recently paused/blocked run |
 | `maiker resume --run-id <id>` | Resumes a specific run |
+| `maiker resume --decision <d>` | Resume with decision: `proceed`, `replan`, or `abort` |
 | `maiker context add --message "..."` | Injects a constraint or update into the running workflow |
 | `maiker context show` | Shows all context updates injected into the current run |
 
@@ -519,10 +524,11 @@ mAIker analyses the impact and either continues, reruns the current stage, or re
 --run-id <id>       # Target a specific run by ID
 --config <path>     # Use a specific config file instead of maiker.config.yaml
 --verbose           # Show every event in detail
---dry-run           # Plan only, make no code changes
+--dry-run           # Plan only, make no code changes (stops after PLAN stage)
+--from-last-run     # Resume from the last run
 --yes               # Skip the pre-flight confirmation prompt
 --follow            # Tail log output live
---json              # Output as machine-readable JSON
+--raw               # Output as raw JSON events (logs command)
 --max-retries <n>   # Override max repair attempts per run
 ```
 
@@ -540,18 +546,10 @@ project:
   package_manager: auto    # auto | npm | yarn | pnpm | bun
 
 # ─── Agent Model Routing ──────────────────────────────────────────────────────
-# Each agent role has its own provider and model.
-# Default: all Claude so you only need one API key to start.
-# Every role is independently swappable — change provider and model per role.
+# Auto-configured by: maiker init (based on your available API keys)
+# Each role is independently swappable — change provider + model for any role.
 # Built-in providers: claude | openai | gemini | pi-mono
-#
-# Examples of what you might use per role:
-#   research_ingestion  → gemini/gemini-2.5-pro  (good at large context ingestion)
-#   planner             → openai/o1              (strong reasoning)
-#   code_generation     → claude/claude-sonnet-4-6 or openai/codex-mini
-#   repair_agent        → claude/claude-sonnet-4-6 (good at targeted diffs)
-#   visual_review       → openai/gpt-4o          (multimodal, good at screenshots)
-#   post_approval       → claude/claude-haiku-4-5 (fast, cheap review)
+# Re-run: maiker init --force to re-detect keys and get new recommendations.
 models:
   research_ingestion:
     provider: claude
@@ -605,7 +603,7 @@ playwright:
 
 # Repair and approval behaviour
 policies:
-  require_human_approval: true          # pause and wait before promoting
+  require_human_approval: true          # pause for human go-ahead before promoting (uses interrupt())
   post_approval_review_required: true   # run regression scan after approval
   max_auto_repairs_per_issue: 3         # retry limit per issue
   max_auto_repairs_per_run: 6           # total repair budget per run
@@ -652,20 +650,38 @@ This requires `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GOOGLE_API_KEY` in you
 
 Every agent role is **independently configurable**. You can mix and match providers per role.
 
-| Role | Default Provider | Default Model | What it does |
-|------|-----------------|---------------|-------------|
-| Research ingestion | claude | claude-sonnet-4-6 | Ingests goal + repo context |
-| Planner | claude | claude-sonnet-4-6 | Creates subtask dependency graph |
-| Code generation | claude | claude-sonnet-4-6 | Implements code changes |
-| Repair | claude | claude-sonnet-4-6 | Fixes validator failures |
-| Visual review | claude | claude-sonnet-4-6 | Reviews Playwright screenshots |
-| Post-approval review | claude | claude-sonnet-4-6 | Scans for hidden regressions |
+### How models are selected
+
+When you run `maiker init`, the recommendation engine scores every known model against each role's requirements:
+
+| Role | Needs | Best picks |
+|------|-------|-----------|
+| Research ingestion | Large context window, reasoning | Gemini 2.5 Pro (1M tokens), Claude Opus |
+| Planner | Strong reasoning, planning | o3, Claude Opus |
+| Code generation | Code quality, repair capability | Claude Sonnet, Codex Mini |
+| Repair agent | Code + analysis, targeted diffs | Claude Sonnet |
+| Visual review | Multimodal/vision (screenshots) | GPT-4o (vision), Claude Sonnet |
+| Post-approval review | Fast, cheap review | Claude Haiku, GPT-4o Mini |
+
+The engine considers: strength match, multimodal capability, cost tier, and context window size. It only recommends models from providers you have API keys for.
+
+### Fallback behaviour
+
+- **Only Claude key** → all roles use Claude (Sonnet for most, Haiku for review)
+- **Claude + OpenAI** → Claude for code/repair, OpenAI for planning (o3) and vision (GPT-4o)
+- **All three keys** → Gemini for research (1M context), OpenAI for planning/vision, Claude for code/repair
+
+### Known models
+
+| Provider | Models | Strengths |
+|----------|--------|-----------|
+| `claude` | claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5 | Code, reasoning, analysis |
+| `openai` | o3, gpt-4o, gpt-4o-mini, codex-mini | Planning, vision, code |
+| `gemini` | gemini-2.5-pro, gemini-2.5-flash | Large context (1M), research |
 
 **Built-in providers:** `claude`, `openai`, `gemini`, `pi-mono`
 
 You can add your own provider adapter in `src/providers/` and use any provider name in config.
-
-To change a role, edit `maiker.config.yaml` → `models` section. The pre-flight screen will show you what's configured before every run.
 
 ---
 
@@ -675,7 +691,7 @@ To change a role, edit `maiker.config.yaml` → `models` section. The pre-flight
 INIT → INSPECT → CLASSIFY → PLAN → EXECUTE (parallel subtasks)
   └─ EXECUTE → VALIDATE_DETERMINISTIC
        ├─ pass → resolve issues → VALIDATE_VISUAL
-       │    ├─ pass → POST_APPROVAL_REVIEW → PROMOTE → DONE
+       │    ├─ pass → POST_APPROVAL_REVIEW (human approval gate) → PROMOTE → DONE
        │    └─ high/critical issues → REPAIR
        └─ fail → create per-validator issues → REPAIR
                    ├─ retry budget ok → VALIDATE_DETERMINISTIC  (repair loop)
@@ -696,8 +712,8 @@ INIT → INSPECT → CLASSIFY → PLAN → EXECUTE (parallel subtasks)
 | **VALIDATE_DETERMINISTIC** | Runs build, lint, typecheck, tests. Per-validator issues created. Resolved issues cleared. |
 | **VALIDATE_VISUAL** | Runs Playwright E2E, captures screenshots, AI visual review |
 | **REPAIR** | Repair agent gets open issues + per-issue attempt counts + history of prior repairs. Tries different approach on repeat attempts. |
-| **HUMAN_ESCALATION** | Writes escalation packet with all context and pauses for human |
-| **POST_APPROVAL_REVIEW** | Scans for hidden regressions and scope drift |
+| **HUMAN_ESCALATION** | Uses LangGraph `interrupt()` to pause graph. Writes escalation packet. Resume with `maiker resume --decision proceed\|replan\|abort` |
+| **POST_APPROVAL_REVIEW** | If `require_human_approval: true`, pauses for human go-ahead (uses `interrupt()`). Then scans for hidden regressions and scope drift. |
 | **PROMOTE** | Writes final summary, cleans up git checkpoint |
 
 ---
@@ -716,6 +732,8 @@ The set of validators that run is chosen automatically based on the task type de
 
 You can override which validators run by editing the `validators:` section in `maiker.config.yaml`.
 
+> **Note:** `accessibility` and `mobile_layout_rules` are declared in the type system but **not yet implemented**. Enabling them in config will result in a skip. Contributions welcome.
+
 ---
 
 ## Architecture Overview
@@ -725,23 +743,27 @@ User / Developer
     ↓
 mAIker CLI  (commander.js)
     ↓
-Pre-flight Screen  (model routing table, validators, policies → Y/n)
+Pre-flight Screen  (key validation, model routing table → Y/n)
     ↓
-Workflow Orchestrator  (src/core/orchestrator/)
-    ↓
-State Machine  (10 nodes, parallel execution)
-    ↓
-Agent Router  (every role independently configurable)
-    ├── Research Agent    → any provider (default: Claude)
-    ├── Planner Agent     → any provider (outputs dependency graph)
-    ├── Code Agent        → any provider (runs in parallel waves)
+LangGraph StateGraph  (src/core/orchestrator/)
+    │
+    ├── Annotation      — typed state with reducers for parallel merging
+    ├── Conditional edges — route between nodes based on stage
+    ├── MemorySaver     — checkpointing for pause/resume
+    └── interrupt()     — human-in-the-loop escalation
+    │
+    ↓  10 nodes, parallel subtask execution
+Agent Router  (auto-selected per role based on available API keys)
+    ├── Research Agent    → any provider (scored: large-context, reasoning)
+    ├── Planner Agent     → any provider (scored: reasoning, planning)
+    ├── Code Agent        → any provider (parallel waves via Promise.allSettled)
     ├── Repair Agent      → any provider (gets attempt counts + history)
-    ├── Visual Review     → any provider (reviews screenshots)
-    └── Post-Approval     → any provider (regression scan)
+    ├── Visual Review     → any provider (scored: multimodal/vision)
+    └── Post-Approval     → any provider (scored: fast, cheap)
     ↓
 Tool Layer
     ├── Shell runner
-    ├── Git (diff, worktree, checkpoints)
+    ├── Git (diff, worktree, checkpoints, rollback)
     ├── Package manager (build, lint, typecheck, tests)
     └── Playwright (E2E + screenshot capture)
     ↓
@@ -755,10 +777,24 @@ Repair Loop
     ├── Issue resolution on pass
     ├── Progress tracking (regression detection)
     ├── Auto-replan at 50% budget
-    └── Human escalation with full context
+    └── Human escalation via LangGraph interrupt()
     ↓
 Promote → DONE
 ```
+
+### Why LangGraph
+
+The orchestrator uses [LangGraph.js](https://github.com/langchain-ai/langgraphjs) (`@langchain/langgraph`) as the workflow engine:
+
+| LangGraph feature | What we use it for |
+|-------------------|-------------------|
+| `StateGraph` | Defines the 10-node workflow graph with typed state |
+| `Annotation` with reducers | Allows parallel nodes to write to shared state safely (e.g. `subtaskStates` merges results from concurrent agents) |
+| `Conditional edges` | Routes between nodes based on validation results, escalation thresholds, and stage transitions |
+| `MemorySaver` | Checkpoints graph state so runs can be paused and resumed from any point |
+| `interrupt()` | Pauses the graph at human escalation and resumes when the user runs `maiker resume --decision replan` |
+
+We use LangGraph for the **graph structure, state management, and checkpointing**. The actual AI calls go through our own provider adapters (not LangChain's LLM classes), keeping model routing independent and swappable.
 
 ### Run folder — what gets written
 
@@ -805,9 +841,10 @@ maiker/
 │   │   ├── commands/          # init, run, validate, repair, status, logs...
 │   │   └── output/            # terminal rendering, tables, event display
 │   ├── core/
-│   │   ├── orchestrator/      # Workflow state machine (parallel execution, 10 nodes)
+│   │   ├── orchestrator/      # LangGraph StateGraph (10 nodes, conditional edges, checkpointing)
 │   │   ├── state/             # Run folder management, state reads/writes, issue tracking
 │   │   ├── router/            # Maps agent roles to model configs
+│   │   ├── models/            # Model registry, scoring engine, key detection, recommendations
 │   │   ├── classification/    # Repo inspector + task classifier
 │   │   └── policies/          # Retry limits, validation profiles, auto-replan, impact analysis
 │   ├── agents/
@@ -903,4 +940,4 @@ MIT — see [LICENSE](./LICENSE)
 
 ---
 
-_Built with [Claude Code](https://claude.ai/claude-code) · Powered by Anthropic, Playwright, and LangGraph_
+_Built with [Claude Code](https://claude.ai/claude-code) · Powered by Anthropic, OpenAI, Gemini, and Playwright_

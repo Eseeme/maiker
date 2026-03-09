@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# mAIker Bootstrap Script
-# Sets up all dependencies and links the CLI for local development
+# mAIker — One-command installer
+# Run this once to install mAIker globally on your machine.
+# Usage: ./scripts/bootstrap.sh
 
 set -euo pipefail
 
@@ -8,74 +9,75 @@ CYAN='\033[0;36m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
+GRAY='\033[0;37m'
+BOLD='\033[1m'
 RESET='\033[0m'
 
 echo ""
-echo -e "  ${CYAN}mAIker Bootstrap${RESET}"
+echo -e "  ${CYAN}${BOLD}mAIker Installer${RESET}"
 echo -e "  ${CYAN}────────────────${RESET}"
 echo ""
 
-# Check Node version
+# ── Check Node ──────────────────────────────────────────────────────────────
 NODE_VERSION=$(node --version 2>/dev/null || echo "not found")
-REQUIRED_NODE="v20"
 
 if [[ "$NODE_VERSION" == "not found" ]]; then
   echo -e "  ${RED}✗${RESET} Node.js not found. Install Node.js v20+ from https://nodejs.org"
   exit 1
 fi
 
-if [[ "$NODE_VERSION" < "$REQUIRED_NODE" ]]; then
-  echo -e "  ${YELLOW}⚠${RESET} Node.js ${NODE_VERSION} detected. mAIker recommends v20+"
+NODE_MAJOR=$(echo "$NODE_VERSION" | sed 's/v\([0-9]*\).*/\1/')
+if [[ "$NODE_MAJOR" -lt 20 ]]; then
+  echo -e "  ${RED}✗${RESET} Node.js ${NODE_VERSION} is too old. mAIker needs v20+"
+  exit 1
 fi
 
 echo -e "  ${GREEN}✓${RESET} Node.js ${NODE_VERSION}"
-
-# Check npm
-if ! command -v npm &> /dev/null; then
-  echo -e "  ${RED}✗${RESET} npm not found"
-  exit 1
-fi
 echo -e "  ${GREEN}✓${RESET} npm $(npm --version)"
 
-# Install dependencies
+# ── Install ─────────────────────────────────────────────────────────────────
 echo ""
-echo -e "  Installing npm dependencies..."
-npm install
+echo -e "  ${BOLD}Step 1/3${RESET} — Installing dependencies..."
+npm install --loglevel=warn
 
-# Build
 echo ""
-echo -e "  Building TypeScript..."
+echo -e "  ${BOLD}Step 2/3${RESET} — Building TypeScript..."
 npm run build
 
-# Link for local development
 echo ""
-echo -e "  Linking maiker CLI..."
-npm link
+echo -e "  ${BOLD}Step 3/3${RESET} — Linking maiker CLI globally..."
+npm link 2>/dev/null || {
+  echo -e "  ${YELLOW}⚠${RESET} npm link failed (may need sudo). Trying with sudo..."
+  sudo npm link
+}
 
-# Setup .env
+# ── Verify ──────────────────────────────────────────────────────────────────
+echo ""
+if command -v maiker &> /dev/null; then
+  echo -e "  ${GREEN}${BOLD}✓ maiker installed successfully!${RESET}"
+else
+  echo -e "  ${YELLOW}⚠${RESET} maiker command not found in PATH. You may need to restart your terminal."
+fi
+
+# ── Setup .env ──────────────────────────────────────────────────────────────
+echo ""
 if [ ! -f .env ]; then
   if [ -f .env.example ]; then
     cp .env.example .env
-    echo -e "  ${YELLOW}⚠${RESET} .env created from .env.example — add your API keys"
+    echo -e "  ${YELLOW}⚠${RESET} Created .env from .env.example — add your API keys"
+  else
+    echo -e "  ${YELLOW}⚠${RESET} No .env file. Create one with: ANTHROPIC_API_KEY=sk-ant-..."
   fi
 else
-  echo -e "  ${GREEN}✓${RESET} .env already exists"
+  echo -e "  ${GREEN}✓${RESET} .env file exists"
 fi
 
-# Setup maiker.config.yaml
-if [ ! -f maiker.config.yaml ]; then
-  if [ -f templates/maiker.config.yaml ]; then
-    cp templates/maiker.config.yaml maiker.config.yaml
-    echo -e "  ${GREEN}✓${RESET} maiker.config.yaml created from template"
-  fi
-fi
-
+# ── Done ────────────────────────────────────────────────────────────────────
 echo ""
-echo -e "  ${GREEN}✓ Bootstrap complete!${RESET}"
+echo -e "  ${GREEN}${BOLD}Installation complete.${RESET}"
 echo ""
-echo -e "  Next steps:"
-echo -e "  ${CYAN}1.${RESET} Add API keys to .env"
-echo -e "  ${CYAN}2.${RESET} Edit maiker.config.yaml"
-echo -e "  ${CYAN}3.${RESET} Run: maiker init"
-echo -e "  ${CYAN}4.${RESET} Run: maiker run ./your-project --goal \"...\""
+echo -e "  ${GRAY}Now go to your project and run:${RESET}"
+echo -e "    ${CYAN}cd /path/to/your-project${RESET}"
+echo -e "    ${CYAN}maiker init${RESET}       ${GRAY}# interactive setup: picks models based on your API keys${RESET}"
+echo -e "    ${CYAN}maiker run . --goal \"your goal\"${RESET}"
 echo ""
