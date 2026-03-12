@@ -31,7 +31,12 @@ export interface PreflightOptions {
   runId: string;
 }
 
-export async function showPreflight(opts: PreflightOptions): Promise<boolean> {
+export interface PreflightResult {
+  confirmed: boolean;
+  switchToDryRun?: boolean;
+}
+
+export async function showPreflight(opts: PreflightOptions): Promise<PreflightResult> {
   const { goal, projectPath, config, runId } = opts;
 
   console.log('');
@@ -146,11 +151,54 @@ export async function showPreflight(opts: PreflightOptions): Promise<boolean> {
   if (missingKeys.length > 0) {
     console.log(chalk.red.bold('  Cannot proceed: missing API keys for configured providers.'));
     console.log(chalk.gray('  Fix: add the keys to .env, or change the models in maiker.config.yaml.\n'));
-    return false;
+    return { confirmed: false };
   }
 
   // ── Prompt ────────────────────────────────────────────────────────────────
-  return askConfirm('  Proceed with these settings? [Y/n] ');
+  while (true) {
+    const answer = await askChoice(
+      '  Proceed with these settings? [Y/n/e] ',
+      ['y', 'n', 'e'],
+      'y',
+    );
+
+    if (answer === 'y') return { confirmed: true };
+
+    if (answer === 'e') {
+      console.log('');
+      console.log(chalk.gray('  Edit maiker.config.yaml and save, then come back here.'));
+      console.log(chalk.gray('  Waiting... press Enter when ready.'));
+      await waitForEnter();
+      console.log(chalk.gray('  Config will be re-read on next run. Re-checking...'));
+      continue;
+    }
+
+    // answer === 'n'
+    console.log('');
+    console.log(chalk.bold('  What would you like to do?'));
+    console.log('');
+    console.log(`    ${chalk.cyan('1')}  Edit config and retry`);
+    console.log(`    ${chalk.cyan('2')}  Run in dry-run mode (plan only, no changes)`);
+    console.log(`    ${chalk.cyan('3')}  Quit`);
+    console.log('');
+
+    const choice = await askChoice('  Choice [1/2/3]: ', ['1', '2', '3'], '3');
+
+    if (choice === '1') {
+      console.log('');
+      console.log(chalk.gray('  Edit maiker.config.yaml, then press Enter to re-check.'));
+      await waitForEnter();
+      continue;
+    }
+
+    if (choice === '2') {
+      console.log(chalk.yellow('  → Switching to dry-run mode (plan only)'));
+      return { confirmed: true, switchToDryRun: true };
+    }
+
+    // choice === '3'
+    return { confirmed: false };
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -171,11 +219,11 @@ function wrapList(items: string[], maxWidth: number, indent: string): string {
   return lines.join('\n');
 }
 
-function askConfirm(prompt: string): Promise<boolean> {
+function askChoice(prompt: string, valid: string[], defaultChoice: string): Promise<string> {
   return new Promise((resolve) => {
     if (!process.stdin.isTTY) {
-      console.log(prompt + chalk.gray('(non-interactive, defaulting to yes)'));
-      resolve(true);
+      console.log(prompt + chalk.gray(`(non-interactive, defaulting to ${defaultChoice})`));
+      resolve(defaultChoice);
       return;
     }
 
@@ -187,7 +235,17 @@ function askConfirm(prompt: string): Promise<boolean> {
     rl.question(chalk.bold(prompt), (answer) => {
       rl.close();
       const ans = answer.trim().toLowerCase();
-      resolve(ans === '' || ans === 'y' || ans === 'yes');
+      if (ans === '' || ans === 'yes') resolve(defaultChoice);
+      else if (valid.includes(ans)) resolve(ans);
+      else resolve(defaultChoice);
     });
+  });
+}
+
+function waitForEnter(): Promise<void> {
+  return new Promise((resolve) => {
+    if (!process.stdin.isTTY) { resolve(); return; }
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(chalk.gray('  Press Enter to continue...'), () => { rl.close(); resolve(); });
   });
 }

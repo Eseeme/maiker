@@ -50,18 +50,22 @@ export function createRunCommand(): Command {
 
       // ── Pre-flight confirmation ─────────────────────────────────────────────
       if (!opts.yes) {
-        const confirmed = await showPreflight({
+        const result = await showPreflight({
           goal: opts.goal,
           projectPath: absPath,
           config,
           runId,
         });
 
-        if (!confirmed) {
+        if (!result.confirmed) {
           console.log('');
-          console.log(chalk.gray('  Cancelled. Edit maiker.config.yaml to change models, then re-run.'));
+          console.log(chalk.gray('  Goodbye!'));
           console.log('');
           process.exit(0);
+        }
+
+        if (result.switchToDryRun) {
+          opts.dryRun = true;
         }
       }
 

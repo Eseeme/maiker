@@ -3,9 +3,30 @@ import type {
   RepairAgentOutput,
   MaikerConfig,
 } from '../../types/index.js';
+import { runToolLoop } from '../shared/tool-loop.js';
 import { callModel, parseJsonFromResponse } from '../shared/base.js';
 
-const SYSTEM_PROMPT = `You are the Repair Agent for mAIker.
+const TOOL_SYSTEM_PROMPT = `You are the Repair Agent for mAIker.
+You have tools to read files, write files, list directories, and run commands.
+
+You are receiving structured validator failures. Your job:
+1. Read the failing files to understand the problem
+2. Apply the smallest safe patch that resolves each issue
+3. Use write_file to apply your fixes
+4. Optionally run the failing command to verify your fix
+
+Rules:
+- Only change relevant files
+- Do not redesign unless necessary
+- Preserve approved behavior
+- Do not remove assertions to make tests pass
+- Use the validator evidence as the source of truth
+- Check "issueAttempts" — if this is attempt 2+, try a DIFFERENT approach
+- Check "priorRepairNotes" to see what was already tried and avoid repeating
+
+When done, respond with a brief summary of what you fixed.`;
+
+const FALLBACK_SYSTEM_PROMPT = `You are the Repair Agent for mAIker.
 You are receiving structured validator failures for a specific subtask.
 Apply the smallest safe patch that resolves the issue without introducing regressions.
 
@@ -33,6 +54,8 @@ export async function runRepairAgent(
   input: RepairAgentInput,
   config: MaikerConfig,
 ): Promise<RepairAgentOutput> {
+  const modelConfig = config.models.repairAgent;
+
   const userMessage = `
 Goal: ${input.goal}
 Project: ${input.projectPath}
@@ -57,10 +80,34 @@ ${input.priorRepairNotes.length > 0 ? input.priorRepairNotes.map((n, i) => `[att
 Additional Context:
 ${input.context ?? 'None'}
 
-Produce a minimal repair plan and return it as JSON.
+Read the failing files, apply minimal fixes, and verify if possible.
 `.trim();
 
-  const modelConfig = config.models.repairAgent;
-  const raw = await callModel(modelConfig, SYSTEM_PROMPT, userMessage);
+  // Use tool loop for Claude — actually fixes files on disk
+  if (modelConfig.provider === 'claude') {
+    const result = await runToolLoop({
+      modelConfig,
+      systemPrompt: TOOL_SYSTEM_PROMPT,
+      userMessage,
+      projectPath: input.projectPath,
+      onToolCall: (name, toolInput) => {
+        if (name === 'write_file') {
+          console.log(`    [repair] write: ${toolInput.path}`);
+        } else if (name === 'run_command') {
+          console.log(`    [repair] run: ${toolInput.command}`);
+        }
+      },
+    });
+
+    return {
+      patchPlan: result.finalText || `Applied fixes to ${result.changedFiles.length} file(s)`,
+      changedFiles: result.changedFiles,
+      expectedImpact: 'Issues should be resolved by the applied patches',
+      residualRisk: '',
+    };
+  }
+
+  // Fallback for non-Claude providers
+  const raw = await callModel(modelConfig, FALLBACK_SYSTEM_PROMPT, userMessage);
   return parseJsonFromResponse<RepairAgentOutput>(raw);
 }

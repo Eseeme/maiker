@@ -131,7 +131,9 @@ export function createInitCommand(): Command {
 
           const confirm = await ask('  Use these models? [Y/n] ');
           if (confirm.toLowerCase() === 'n') {
-            console.log(chalk.gray('  You can edit maiker.config.yaml manually after init.\n'));
+            console.log('');
+            console.log(chalk.gray('  No problem — the config will be written with defaults.'));
+            console.log(chalk.gray('  You can edit maiker.config.yaml after init to set your preferred models.\n'));
             modelRouting = undefined;
           }
         }

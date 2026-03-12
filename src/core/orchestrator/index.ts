@@ -288,7 +288,18 @@ async function nodePlan(state: GraphState): Promise<Partial<GraphState>> {
     plan.assumptions.push(`Fallback plan used: ${String(err)}`);
   }
 
-  plan.validationProfile = getValidationProfile(classification);
+  const rawProfile = getValidationProfile(classification);
+  // Filter profile by config validators — only run validators the user has enabled
+  plan.validationProfile = {
+    ...rawProfile,
+    required: rawProfile.required.filter(v => state.config.validators[v] !== false),
+    optional: rawProfile.optional.filter(v => state.config.validators[v] !== false),
+    skipped: [
+      ...rawProfile.skipped,
+      ...rawProfile.required.filter(v => state.config.validators[v] === false),
+      ...rawProfile.optional.filter(v => state.config.validators[v] === false),
+    ],
+  };
   await savePlan(state.runId, plan);
   emitStageCompleted(state.runId, 'PLAN');
 
@@ -852,7 +863,7 @@ async function nodePromote(state: GraphState): Promise<Partial<GraphState>> {
 function routeByStage(state: GraphState): string {
   switch (state.stage) {
     case 'CLASSIFY':              return 'classify';
-    case 'PLAN':                  return 'plan';
+    case 'PLAN':                  return 'planNode';
     case 'EXECUTE':               return 'execute';
     case 'VALIDATE_DETERMINISTIC':return 'validateDeterministic';
     case 'VALIDATE_VISUAL':       return 'validateVisual';
@@ -876,7 +887,7 @@ function buildWorkflowGraph() {
     // ── Add all nodes ──
     .addNode('inspect',              nodeInspect)
     .addNode('classify',             nodeClassify)
-    .addNode('plan',                 nodePlan)
+    .addNode('planNode',             nodePlan)
     .addNode('execute',              nodeExecute)
     .addNode('validateDeterministic',nodeValidateDeterministic)
     .addNode('validateVisual',       nodeValidateVisual)
@@ -891,7 +902,7 @@ function buildWorkflowGraph() {
     // ── Conditional edges: each node routes to next based on state.stage ──
     .addConditionalEdges('inspect',              routeByStage)
     .addConditionalEdges('classify',             routeByStage)
-    .addConditionalEdges('plan',                 routeByStage)
+    .addConditionalEdges('planNode',             routeByStage)
     .addConditionalEdges('execute',              routeByStage)
     .addConditionalEdges('validateDeterministic',routeByStage)
     .addConditionalEdges('validateVisual',       routeByStage)

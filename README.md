@@ -47,26 +47,32 @@ After installation, you point it at **any project on your computer** and give it
 
 Do this **once**, inside the `maiker` repository folder (the folder you cloned).
 
-**Requires:** Node.js 20+ ([nodejs.org](https://nodejs.org))
+**Requires:** Node.js 18+ ([nodejs.org](https://nodejs.org))
 
-### Option A — One command (recommended)
+### One command (recommended)
 
 ```bash
-./scripts/bootstrap.sh
+sudo ./scripts/bootstrap.sh
 ```
 
-This does everything: checks Node version, installs dependencies, builds TypeScript, links the `maiker` command globally, and sets up `.env`.
+This does everything:
+- Checks Node version
+- Fixes any file permission issues from previous installs
+- Installs dependencies (as your user, not root)
+- Builds TypeScript (as your user, not root)
+- Links the `maiker` command globally (needs sudo)
+- Sets correct permissions on the global binary
+- Detects available authentication (Claude Code OAuth, API keys)
 
-### Option B — Manual steps
+> **Why sudo?** The `npm link` step installs a global binary in `/usr/local/bin/`, which requires root. The bootstrap runs `npm install` and `npm run build` as your real user to avoid permission issues.
 
-If you prefer to run each step yourself:
+### Manual steps (alternative)
 
 ```bash
-npm run setup              # install + build + link in one command
-# OR do it step by step:
 npm install                # install dependencies
 npm run build              # compile TypeScript
-npm link                   # register maiker command globally
+sudo npm link              # register maiker command globally
+sudo chmod +x /usr/local/bin/maiker  # ensure binary is executable
 ```
 
 ### Verify it works
@@ -83,16 +89,25 @@ maiker --help
 
 ---
 
-## Part 2 — Set up your API keys
+## Part 2 — Authentication
 
-mAIker needs API keys to call AI models. Set them in the maiker repo's `.env` file:
+mAIker needs API keys to call AI models. You need **at least one** provider.
+
+### Option A — Claude Code (easiest, no .env needed)
+
+If you use [Claude Code](https://claude.ai/claude-code), mAIker **automatically detects** your OAuth token from `~/.claude/.credentials.json`. No `.env` file needed for Anthropic.
 
 ```bash
-# Inside the maiker repo folder
-cp .env.example .env
+# Just make sure you're logged in:
+claude auth login
+# That's it — mAIker picks up the token automatically
 ```
 
-Add the keys for the providers you want to use:
+The token refreshes automatically. mAIker always reads the latest token at startup, and prefers a fresh OAuth token over a stale one from `.env`.
+
+### Option B — API keys in .env
+
+Create a `.env` file in your **project folder** (where you run `maiker init`):
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-api03-...    # Claude (code, repair, review)
@@ -101,6 +116,14 @@ GOOGLE_API_KEY=AIza...                # Gemini (research, large context)
 ```
 
 **You don't need all three.** Even a single key works — `maiker init` will detect which keys you have and pick the best model for each role automatically.
+
+### Provider summary
+
+| Provider | Env Variable | Auto-detect | How to get |
+|----------|-------------|-------------|------------|
+| Claude | `ANTHROPIC_API_KEY` | From Claude Code OAuth | [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) |
+| OpenAI | `OPENAI_API_KEY` | .env only | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| Gemini | `GOOGLE_API_KEY` | .env only | [aistudio.google.dev/apikey](https://aistudio.google.dev/apikey) |
 
 ---
 
@@ -269,8 +292,12 @@ Before every run, mAIker shows a **pre-flight screen** that validates your setup
   Human approval:       required
   Post-approval review: enabled
 
-  Proceed with these settings? [Y/n]
+  Proceed with these settings? [Y/n/e]
 ```
+
+- **Y** (or Enter) — proceed with the run
+- **n** — opens a menu: edit config and retry, switch to dry-run, or quit
+- **e** — pause to edit `maiker.config.yaml`, then press Enter to re-check
 
 ### Key validation
 
@@ -291,7 +318,7 @@ If a configured provider is missing its API key, pre-flight **blocks the run** a
   Cannot proceed: missing API keys for configured providers.
 ```
 
-Press Enter to proceed, or `n` to abort. In CI/non-TTY environments, defaults to yes (but still blocks on missing keys).
+In CI/non-TTY environments, defaults to yes (but still blocks on missing keys).
 
 ---
 
@@ -854,7 +881,10 @@ maiker/
 │   │   ├── repair/            # Repair agent (receives attempt counts + history)
 │   │   ├── visual/            # Visual review agent
 │   │   ├── review/            # Post-approval review agent
-│   │   └── shared/            # Provider dispatcher (routes to Claude/OpenAI/Gemini/etc.)
+│   │   └── shared/
+│   │       ├── base.ts        # Provider dispatcher (routes to Claude/OpenAI/Gemini)
+│   │       ├── tool-loop.ts   # LLM ↔ tool-use cycle (multi-turn agent loop)
+│   │       └── tools.ts       # Tool definitions + disk execution (read/write/list/run)
 │   ├── providers/
 │   │   ├── claude/            # Anthropic SDK
 │   │   ├── openai/            # OpenAI SDK
@@ -909,7 +939,10 @@ npx tsx bin/maiker.ts run ./app --goal "..."
 
 ```bash
 npm run build
-# The global maiker command now uses the updated build
+# The global maiker command now uses the updated build (it's symlinked)
+
+# Or rebuild + re-link everything:
+sudo ./scripts/bootstrap.sh
 ```
 
 ### Adding a new provider
