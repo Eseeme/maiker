@@ -1,9 +1,6 @@
 import { Command } from 'commander';
-import { readFileSync } from 'fs';
-import { join } from 'path';
-import { homedir } from 'os';
 import chalk from 'chalk';
-import { banner, success, fail, warn } from '../output/index.js';
+import { banner, success, fail } from '../output/index.js';
 import {
   detectAvailableProviders,
   validateProviderKey,
@@ -13,6 +10,7 @@ import {
 import type { AgentRole } from '../../core/models/index.js';
 import { loadConfig } from '../../config/index.js';
 import type { ModelConfig } from '../../types/index.js';
+import { detectOAuthToken } from '../oauth.js';
 
 export function createAuthCommand(): Command {
   return new Command('auth')
@@ -44,39 +42,30 @@ export function createAuthCommand(): Command {
       console.log(chalk.bold('  Claude Code OAuth'));
       console.log('');
 
-      try {
-        const credsPath = join(homedir(), '.claude', '.credentials.json');
-        const creds = JSON.parse(readFileSync(credsPath, 'utf-8'));
-        const token = creds?.claudeAiOauth?.accessToken;
-        const expiresAt = creds?.claudeAiOauth?.expiresAt;
+      const oauth = detectOAuthToken();
 
-        if (token && expiresAt) {
-          const now = Date.now();
-          const hoursLeft = (expiresAt - now) / (1000 * 60 * 60);
+      if (oauth.found && oauth.token) {
+        const sourceLabel = oauth.source === 'keychain' ? 'macOS Keychain' : 'credentials file';
 
-          if (hoursLeft > 0) {
-            console.log(`    ${chalk.green('✓')} OAuth token found`);
-            console.log(`    ${chalk.gray('Expires in:')} ${hoursLeft.toFixed(1)} hours`);
+        if (oauth.hoursLeft !== undefined && oauth.hoursLeft > 0) {
+          console.log(`    ${chalk.green('✓')} OAuth token found (${sourceLabel})`);
+          console.log(`    ${chalk.gray('Expires in:')} ${oauth.hoursLeft.toFixed(1)} hours`);
 
-            const currentEnvKey = process.env.ANTHROPIC_API_KEY ?? '';
-            if (currentEnvKey.startsWith('sk-ant-oat')) {
-              console.log(`    ${chalk.green('✓')} Active — being used as ANTHROPIC_API_KEY`);
-            } else if (!currentEnvKey) {
-              console.log(`    ${chalk.green('✓')} Active — will be used (no .env key set)`);
-            } else {
-              console.log(`    ${chalk.gray('ℹ')} Not used — .env has a non-OAuth ANTHROPIC_API_KEY`);
-            }
+          const currentEnvKey = process.env.ANTHROPIC_API_KEY ?? '';
+          if (currentEnvKey.startsWith('sk-ant-oat')) {
+            console.log(`    ${chalk.green('✓')} Active — being used as ANTHROPIC_API_KEY`);
+          } else if (!currentEnvKey) {
+            console.log(`    ${chalk.green('✓')} Active — will be used (no .env key set)`);
           } else {
-            console.log(`    ${chalk.red('✗')} OAuth token expired (${Math.abs(hoursLeft).toFixed(1)} hours ago)`);
-            console.log(`    ${chalk.gray('Fix:')} ${chalk.cyan('claude auth login')}`);
+            console.log(`    ${chalk.gray('ℹ')} Not used — .env has a non-OAuth ANTHROPIC_API_KEY`);
           }
         } else {
-          console.log(`    ${chalk.gray('✗')} No OAuth token found`);
-          console.log(`    ${chalk.gray('To set up:')} ${chalk.cyan('claude auth login')}`);
+          console.log(`    ${chalk.red('✗')} OAuth token expired (${Math.abs(oauth.hoursLeft ?? 0).toFixed(1)} hours ago)`);
+          console.log(`    ${chalk.gray('Fix:')} ${chalk.cyan('claude auth login')}`);
         }
-      } catch {
-        console.log(`    ${chalk.gray('✗')} Claude Code not installed or no credentials`);
-        console.log(`    ${chalk.gray('Install:')} ${chalk.cyan('https://claude.ai/claude-code')}`);
+      } else {
+        console.log(`    ${chalk.gray('✗')} ${oauth.error ?? 'No OAuth token found'}`);
+        console.log(`    ${chalk.gray('To set up:')} ${chalk.cyan('claude auth login')}`);
       }
 
       // ── Validate keys (optional) ────────────────────────────────────

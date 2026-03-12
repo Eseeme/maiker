@@ -99,9 +99,32 @@ echo -e "  ${BOLD}Step 4/4${RESET} — Detecting authentication..."
 AUTH_FOUND=false
 
 # Claude Code OAuth (auto-detected at runtime — no .env needed)
-CLAUDE_CREDS="/home/$REAL_USER/.claude/.credentials.json"
-if [ -f "$CLAUDE_CREDS" ]; then
-  HAS_OAUTH=$(python3 -c "
+# macOS: stored in Keychain; Linux: stored in ~/.claude/.credentials.json
+if [[ "$(uname)" == "Darwin" ]]; then
+  # macOS — try Keychain
+  KEYCHAIN_DATA=$(sudo -u "$REAL_USER" security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || echo "")
+  if [[ -n "$KEYCHAIN_DATA" ]]; then
+    HAS_OAUTH=$(echo "$KEYCHAIN_DATA" | python3 -c "
+import json, sys
+try:
+  d = json.load(sys.stdin)
+  t = d.get('claudeAiOauth', {}).get('accessToken', '')
+  print('yes' if t else 'no')
+except: print('no')
+" 2>/dev/null || echo "no")
+    if [[ "$HAS_OAUTH" == "yes" ]]; then
+      echo -e "  ${GREEN}✓${RESET} Claude Code OAuth detected (macOS Keychain)"
+      AUTH_FOUND=true
+    fi
+  fi
+fi
+
+if [[ "$AUTH_FOUND" == "false" ]]; then
+  # Linux / fallback — try credentials file
+  CLAUDE_CREDS_HOME=$(eval echo "~$REAL_USER")
+  CLAUDE_CREDS="$CLAUDE_CREDS_HOME/.claude/.credentials.json"
+  if [ -f "$CLAUDE_CREDS" ]; then
+    HAS_OAUTH=$(python3 -c "
 import json
 try:
   d = json.load(open('$CLAUDE_CREDS'))
@@ -109,10 +132,10 @@ try:
   print('yes' if t else 'no')
 except: print('no')
 " 2>/dev/null || echo "no")
-
-  if [[ "$HAS_OAUTH" == "yes" ]]; then
-    echo -e "  ${GREEN}✓${RESET} Claude Code OAuth detected — no .env needed for Anthropic"
-    AUTH_FOUND=true
+    if [[ "$HAS_OAUTH" == "yes" ]]; then
+      echo -e "  ${GREEN}✓${RESET} Claude Code OAuth detected (credentials file)"
+      AUTH_FOUND=true
+    fi
   fi
 fi
 

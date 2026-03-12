@@ -81,24 +81,10 @@ export async function runCLI(argv: string[] = process.argv): Promise<void> {
     config();
   } catch { /* dotenv is optional */ }
 
-  // Auto-detect fresh Claude Code OAuth token from ~/.claude/.credentials.json
+  // Auto-detect Claude Code OAuth token (macOS Keychain or Linux JSON file)
   // Always prefer a fresh OAuth token over a stale one from .env
-  try {
-    const { readFileSync } = await import('fs');
-    const { join } = await import('path');
-    const { homedir } = await import('os');
-    const credsPath = join(homedir(), '.claude', '.credentials.json');
-    const creds = JSON.parse(readFileSync(credsPath, 'utf-8'));
-    const token = creds?.claudeAiOauth?.accessToken;
-    const expiresAt = creds?.claudeAiOauth?.expiresAt;
-    if (token && expiresAt && Date.now() < expiresAt) {
-      // Fresh token available — use it if no key set, or if current key is a stale OAuth token
-      const current = process.env.ANTHROPIC_API_KEY ?? '';
-      if (!current || current.startsWith('sk-ant-oat')) {
-        process.env.ANTHROPIC_API_KEY = token;
-      }
-    }
-  } catch { /* no Claude Code credentials available */ }
+  const { applyOAuthToken } = await import('./oauth.js');
+  applyOAuthToken();
 
   const program = createCLI();
 
