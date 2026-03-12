@@ -16,6 +16,7 @@ import { createPauseCommand } from './commands/pause.js';
 import { createResumeCommand } from './commands/resume.js';
 import { createContextCommand } from './commands/context.js';
 import { createArtifactsCommand } from './commands/artifacts.js';
+import { createAuthCommand } from './commands/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -41,9 +42,11 @@ export function createCLI(): Command {
     .addHelpText('after', `
 Examples:
   $ maiker init
+  $ maiker auth                          # check API keys & OAuth status
+  $ maiker auth --validate               # test API connectivity
   $ maiker run ./app --goal "Make dashboard mobile responsive"
-  $ maiker inspect ./app
-  $ maiker status
+  $ maiker status                        # show latest run status
+  $ maiker status --all                  # list all runs
   $ maiker logs --follow
   $ maiker context add --message "Do not modify desktop nav"
     `);
@@ -63,6 +66,7 @@ Examples:
   program.addCommand(createResumeCommand());
   program.addCommand(createContextCommand());
   program.addCommand(createArtifactsCommand());
+  program.addCommand(createAuthCommand());
 
   // Error handling
   program.exitOverride();
