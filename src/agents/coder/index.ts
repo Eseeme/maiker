@@ -5,6 +5,8 @@ import type {
 } from '../../types/index.js';
 import { runToolLoop } from '../shared/tool-loop.js';
 import { callModel, parseJsonFromResponse } from '../shared/base.js';
+import fs from 'fs-extra';
+import { resolve, dirname } from 'path';
 
 const TOOL_SYSTEM_PROMPT = `You are the Code Agent for mAIker.
 You have tools to read files, write files, list directories, and run commands.
@@ -32,14 +34,25 @@ Prefer minimal blast radius.
 Do not refactor unrelated files.
 Do not weaken tests to make them pass.
 
+You MUST return the COMPLETE file contents for every file you create or modify.
+
 Return a JSON object with this exact shape:
 {
-  "changedFiles": ["string"],
+  "changedFiles": ["relative/path/to/file.ts"],
+  "files": [
+    {
+      "path": "relative/path/to/file.ts",
+      "content": "the FULL file content to write to disk"
+    }
+  ],
   "implementationNotes": "string describing what was changed and why",
   "riskNotes": "string describing any risks introduced"
 }
 
-Return ONLY the JSON object.`;
+IMPORTANT:
+- "files" must contain one entry for every path listed in "changedFiles"
+- "content" must be the COMPLETE file content, not a diff or partial snippet
+- Return ONLY the JSON object.`;
 
 export async function runCodeAgent(
   input: CodeAgentInput,
@@ -74,9 +87,24 @@ export async function runCodeAgent(
     };
   }
 
-  // Fallback for non-Claude providers — returns JSON plan (no tool use)
+  // Fallback for non-Claude providers — parse JSON and write files to disk
   const raw = await callModel(modelConfig, FALLBACK_SYSTEM_PROMPT, userMessage);
-  return parseJsonFromResponse<CodeAgentOutput>(raw);
+  const parsed = parseJsonFromResponse<CodeAgentOutput & { files?: { path: string; content: string }[] }>(raw);
+
+  if (parsed.files && parsed.files.length > 0) {
+    for (const file of parsed.files) {
+      const filePath = resolve(input.projectPath, file.path);
+      await fs.ensureDir(dirname(filePath));
+      await fs.writeFile(filePath, file.content, 'utf-8');
+      console.log(`    [coder] write: ${file.path}`);
+    }
+  }
+
+  return {
+    changedFiles: parsed.changedFiles,
+    implementationNotes: parsed.implementationNotes,
+    riskNotes: parsed.riskNotes,
+  };
 }
 
 function buildUserMessage(input: CodeAgentInput): string {

@@ -108,6 +108,23 @@ export async function loadJobSpec(
   return fs.readJson(join(dir, 'job.json')) as Promise<JobSpec>;
 }
 
+// ─── State Write Mutex ───────────────────────────────────────────────────────
+// Prevents race conditions when parallel subtasks (Promise.allSettled) write
+// state concurrently. Each runId gets its own serialised queue.
+
+const stateMutexes = new Map<string, Promise<unknown>>();
+
+async function withStateLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = stateMutexes.get(runId) ?? Promise.resolve();
+  const next = prev.then(fn, fn); // always run fn, even if prior rejected
+  stateMutexes.set(runId, next);
+  // Clean up after settling to avoid memory leak
+  next.finally(() => {
+    if (stateMutexes.get(runId) === next) stateMutexes.delete(runId);
+  });
+  return next;
+}
+
 // ─── State Writes ─────────────────────────────────────────────────────────────
 
 export async function updateRunState(
@@ -115,15 +132,17 @@ export async function updateRunState(
   patch: Partial<RunState>,
   baseDir: string = RUNS_DIR,
 ): Promise<RunState> {
-  const current = await loadRunState(runId, baseDir);
-  const updated: RunState = {
-    ...current,
-    ...patch,
-    lastUpdatedAt: new Date().toISOString(),
-  };
-  const dir = getRunDir(runId, baseDir);
-  await fs.writeJson(join(dir, 'state.json'), updated, { spaces: 2 });
-  return updated;
+  return withStateLock(runId, async () => {
+    const current = await loadRunState(runId, baseDir);
+    const updated: RunState = {
+      ...current,
+      ...patch,
+      lastUpdatedAt: new Date().toISOString(),
+    };
+    const dir = getRunDir(runId, baseDir);
+    await fs.writeJson(join(dir, 'state.json'), updated, { spaces: 2 });
+    return updated;
+  });
 }
 
 export async function setStage(

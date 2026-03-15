@@ -103,9 +103,9 @@ export function shouldContinueRepair(
   retryCounts: Record<string, number>,
   policy: PolicyConfig,
 ): boolean {
-  const totalRepairs = Object.values(retryCounts)
-    .filter((_, i) => Object.keys(retryCounts)[i]?.startsWith('issue:'))
-    .reduce((a, b) => a + b, 0);
+  const totalRepairs = Object.entries(retryCounts)
+    .filter(([key]) => key.startsWith('issue:'))
+    .reduce((sum, [, count]) => sum + count, 0);
   return totalRepairs < policy.maxAutoRepairsPerRun;
 }
 
@@ -124,25 +124,25 @@ export function analyseContextImpact(
 ): 'low' | 'medium' | 'high' {
   const lower = message.toLowerCase();
 
-  // High impact — affects plan or constraints
+  // High impact — affects plan or constraints (word-boundary matching)
   if (
-    lower.includes('do not') ||
-    lower.includes("don't") ||
-    lower.includes('never') ||
-    lower.includes('replan') ||
-    lower.includes('change the approach') ||
-    lower.includes('start over')
+    /\bdo not\b/.test(lower) ||
+    /\bdon't\b/.test(lower) ||
+    /\bnever\b/.test(lower) ||
+    /\breplan\b/.test(lower) ||
+    /\bchange the approach\b/.test(lower) ||
+    /\bstart over\b/.test(lower)
   ) {
     return 'high';
   }
 
-  // Medium impact — affects current stage or implementation
+  // Medium impact — affects current stage or implementation (word-boundary matching)
   if (
-    lower.includes('also') ||
-    lower.includes('additionally') ||
-    lower.includes('make sure') ||
-    lower.includes('remember to') ||
-    lower.includes('important:')
+    /\balso\b/.test(lower) ||
+    /\badditionally\b/.test(lower) ||
+    /\bmake sure\b/.test(lower) ||
+    /\bremember to\b/.test(lower) ||
+    /\bimportant:/.test(lower)
   ) {
     return 'medium';
   }

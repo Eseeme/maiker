@@ -19,11 +19,12 @@
 import {
   StateGraph,
   Annotation,
-  MemorySaver,
   interrupt,
+  Command,
   END,
   START,
 } from '@langchain/langgraph';
+import { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
 
 import type {
   WorkflowInput,
@@ -41,6 +42,7 @@ import type {
   ValidatorName,
   RunStatus,
 } from '../../types/index.js';
+import { classifyError } from '../../types/index.js';
 import {
   initRunFolder,
   updateRunState,
@@ -284,8 +286,12 @@ async function nodePlan(state: GraphState): Promise<Partial<GraphState>> {
     }
     emitAgentCompleted(state.runId, 'planner');
   } catch (err) {
-    console.warn(`[maiker] Planner agent failed, using fallback plan: ${String(err)}`);
-    plan.assumptions.push(`Fallback plan used: ${String(err)}`);
+    const classified = classifyError(err);
+    console.warn(`[maiker] Planner agent failed [${classified.category}], using fallback plan: ${classified.message}`);
+    plan.assumptions.push(`Fallback plan used (${classified.category}): ${classified.message}`);
+    if (classified.category === 'auth') {
+      return { plan, stage: 'FAILED' as WorkflowStage, status: 'failed' as RunStatus, error: `Auth error: ${classified.message}` };
+    }
   }
 
   const rawProfile = getValidationProfile(classification);
@@ -349,6 +355,9 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
     gitCheckpointRef,
   };
 
+  // Cache repo context once (avoid redundant summariseRepo calls per subtask)
+  const cachedRepoContext = await summariseRepo(state.projectPath);
+
   // Execute wave by wave
   for (const wave of waves) {
     const conflicts = detectFileConflicts(wave);
@@ -370,7 +379,7 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
             acceptanceCriteria: subtask.acceptanceCriteria,
             fileTargets: subtask.fileTargets,
             noTouchConstraints: plan.classification.noTouchZones,
-            repoContext: await summariseRepo(state.projectPath),
+            repoContext: cachedRepoContext,
             context: state.contextUpdates.map(c => c.message).join('\n'),
             sharedContext,
           }, state.config);
@@ -403,15 +412,16 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
           emitAgentCompleted(state.runId, 'coder');
           console.log(`[maiker] ✓ ${subtask.id}: ${result.implementationNotes}`);
         } else {
+          const classified = classifyError(settled.reason);
           subtaskStates[subtask.id] = {
             subtaskId: subtask.id,
             status: 'failed',
             startedAt: new Date().toISOString(),
             changedFiles: [],
             implementationNotes: '',
-            error: String(settled.reason),
+            error: `[${classified.category}] ${classified.message}`,
           };
-          console.warn(`[maiker] ✗ ${subtask.id}: ${String(settled.reason)}`);
+          console.warn(`[maiker] ✗ ${subtask.id} [${classified.category}]: ${classified.message}`);
           emitAgentCompleted(state.runId, 'coder');
         }
       }
@@ -683,12 +693,24 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
       status: 'running' as RunStatus,
     };
   } catch (err) {
-    console.warn(`[maiker] Repair agent failed: ${String(err)}`);
+    const classified = classifyError(err);
+    console.warn(`[maiker] Repair agent failed [${classified.category}]: ${classified.message}`);
     emitStageCompleted(state.runId, 'REPAIR');
+
+    // Auth errors should escalate immediately, not retry
+    if (classified.category === 'auth') {
+      return {
+        stage: 'HUMAN_ESCALATION' as WorkflowStage,
+        retryCounts: { ...state.retryCounts, run: runRetry },
+        repairHistory: [`[attempt ${runRetry}] AUTH FAILURE: ${classified.message}`],
+        status: 'running' as RunStatus,
+      };
+    }
+
     return {
       stage: 'VALIDATE_DETERMINISTIC' as WorkflowStage,
       retryCounts: { ...state.retryCounts, run: runRetry },
-      repairHistory: [`[attempt ${runRetry}] FAILED: ${String(err)}`],
+      repairHistory: [`[attempt ${runRetry}] FAILED [${classified.category}]: ${classified.message}`],
       status: 'running' as RunStatus,
     };
   }
@@ -887,13 +909,21 @@ function buildWorkflowGraph() {
     // ── Add all nodes ──
     .addNode('inspect',              nodeInspect)
     .addNode('classify',             nodeClassify)
-    .addNode('planNode',             nodePlan)
-    .addNode('execute',              nodeExecute)
+    .addNode('planNode',             nodePlan, {
+      retryPolicy: { maxAttempts: 3, initialInterval: 1000, backoffFactor: 2, jitter: true },
+    })
+    .addNode('execute',              nodeExecute, {
+      retryPolicy: { maxAttempts: 3, initialInterval: 1000, backoffFactor: 2, jitter: true },
+    })
     .addNode('validateDeterministic',nodeValidateDeterministic)
     .addNode('validateVisual',       nodeValidateVisual)
-    .addNode('repair',               nodeRepair)
+    .addNode('repair',               nodeRepair, {
+      retryPolicy: { maxAttempts: 3, initialInterval: 1000, backoffFactor: 2, jitter: true },
+    })
     .addNode('humanEscalation',      nodeHumanEscalation)
-    .addNode('postApprovalReview',   nodePostApprovalReview)
+    .addNode('postApprovalReview',   nodePostApprovalReview, {
+      retryPolicy: { maxAttempts: 3, initialInterval: 1000, backoffFactor: 2, jitter: true },
+    })
     .addNode('promote',              nodePromote)
 
     // ── Entry edge ──
@@ -916,8 +946,8 @@ function buildWorkflowGraph() {
 
 // ─── Workflow Runner ──────────────────────────────────────────────────────────
 
-// Single shared checkpointer for all runs
-const checkpointer = new MemorySaver();
+// Persistent SQLite checkpointer — survives process restarts for durable resume
+const checkpointer = SqliteSaver.fromConnString('.maiker/checkpoints.db');
 
 export async function runWorkflow(input: WorkflowInput): Promise<GraphState> {
   const { runId, goal, projectPath, config } = input;
@@ -994,9 +1024,9 @@ export async function resumeWorkflow(
   await eventBus.attachRunLog(runId, config.artifacts.outputDir);
 
   // Resume the graph — LangGraph replays from checkpoint and
-  // passes the decision as the interrupt response
+  // passes the decision as the interrupt resume value
   const finalState = await app.invoke(
-    null,  // null = resume from checkpoint
+    new Command({ resume: decision }),
     {
       configurable: { thread_id: runId },
     },

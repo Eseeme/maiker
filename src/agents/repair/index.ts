@@ -5,6 +5,8 @@ import type {
 } from '../../types/index.js';
 import { runToolLoop } from '../shared/tool-loop.js';
 import { callModel, parseJsonFromResponse } from '../shared/base.js';
+import fs from 'fs-extra';
+import { resolve, dirname } from 'path';
 
 const TOOL_SYSTEM_PROMPT = `You are the Repair Agent for mAIker.
 You have tools to read files, write files, list directories, and run commands.
@@ -40,15 +42,26 @@ Rules:
 - if this is attempt 2+, try a DIFFERENT approach than previous attempts
 - check "priorRepairNotes" to see what was already tried and avoid repeating
 
+You MUST return the COMPLETE file contents for every file you modify.
+
 Return a JSON object with this exact shape:
 {
   "patchPlan": "string describing the minimal patch to apply",
-  "changedFiles": ["string"],
+  "changedFiles": ["relative/path/to/file.ts"],
+  "files": [
+    {
+      "path": "relative/path/to/file.ts",
+      "content": "the FULL file content to write to disk"
+    }
+  ],
   "expectedImpact": "string describing what should be fixed",
   "residualRisk": "string describing remaining risks"
 }
 
-Return ONLY the JSON object.`;
+IMPORTANT:
+- "files" must contain one entry for every path listed in "changedFiles"
+- "content" must be the COMPLETE file content, not a diff or partial snippet
+- Return ONLY the JSON object.`;
 
 export async function runRepairAgent(
   input: RepairAgentInput,
@@ -107,7 +120,23 @@ Read the failing files, apply minimal fixes, and verify if possible.
     };
   }
 
-  // Fallback for non-Claude providers
+  // Fallback for non-Claude providers — parse JSON and write files to disk
   const raw = await callModel(modelConfig, FALLBACK_SYSTEM_PROMPT, userMessage);
-  return parseJsonFromResponse<RepairAgentOutput>(raw);
+  const parsed = parseJsonFromResponse<RepairAgentOutput & { files?: { path: string; content: string }[] }>(raw);
+
+  if (parsed.files && parsed.files.length > 0) {
+    for (const file of parsed.files) {
+      const filePath = resolve(input.projectPath, file.path);
+      await fs.ensureDir(dirname(filePath));
+      await fs.writeFile(filePath, file.content, 'utf-8');
+      console.log(`    [repair] write: ${file.path}`);
+    }
+  }
+
+  return {
+    patchPlan: parsed.patchPlan,
+    changedFiles: parsed.changedFiles,
+    expectedImpact: parsed.expectedImpact,
+    residualRisk: parsed.residualRisk,
+  };
 }
