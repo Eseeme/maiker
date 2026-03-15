@@ -183,7 +183,8 @@ You can always change models later in `maiker.config.yaml`. Skip interactive set
 your-app/
 ├── maiker.config.yaml    ← created by maiker init (with your model choices)
 ├── .maiker/              ← created by maiker init
-│   └── runs/             ← run outputs will go here
+│   ├── runs/             ← run outputs will go here
+│   └── checkpoints.db    ← LangGraph durable checkpoints (SqliteSaver)
 ├── src/
 ├── package.json
 └── ...your files...
@@ -776,8 +777,9 @@ LangGraph StateGraph  (src/core/orchestrator/)
     │
     ├── Annotation      — typed state with reducers for parallel merging
     ├── Conditional edges — route between nodes based on stage
-    ├── MemorySaver     — checkpointing for pause/resume
-    └── interrupt()     — human-in-the-loop escalation
+    ├── SqliteSaver     — durable checkpointing for pause/resume (persists across restarts)
+    ├── interrupt()     — human-in-the-loop escalation
+    └── RetryPolicy     — automatic retry with backoff on LLM-calling nodes
     │
     ↓  10 nodes, parallel subtask execution
 Agent Router  (auto-selected per role based on available API keys)
@@ -787,6 +789,14 @@ Agent Router  (auto-selected per role based on available API keys)
     ├── Repair Agent      → any provider (gets attempt counts + history)
     ├── Visual Review     → any provider (scored: multimodal/vision)
     └── Post-Approval     → any provider (scored: fast, cheap)
+    ↓
+Error Classification  (src/types/ — classifyError())
+    ├── transient (rate limit, timeout)  → auto-retry with backoff
+    ├── auth (invalid key, 401)          → escalate immediately
+    ├── validation (build/lint/test)     → repair loop
+    ├── resource (OOM, disk full)        → escalate
+    ├── dependency (missing module)      → targeted fix
+    └── code_generation (parse error)    → retry
     ↓
 Tool Layer
     ├── Shell runner
@@ -818,10 +828,145 @@ The orchestrator uses [LangGraph.js](https://github.com/langchain-ai/langgraphjs
 | `StateGraph` | Defines the 10-node workflow graph with typed state |
 | `Annotation` with reducers | Allows parallel nodes to write to shared state safely (e.g. `subtaskStates` merges results from concurrent agents) |
 | `Conditional edges` | Routes between nodes based on validation results, escalation thresholds, and stage transitions |
-| `MemorySaver` | Checkpoints graph state so runs can be paused and resumed from any point |
-| `interrupt()` | Pauses the graph at human escalation and resumes when the user runs `maiker resume --decision replan` |
+| `SqliteSaver` | Durably checkpoints graph state to `.maiker/checkpoints.db` so runs survive process restarts and can be paused/resumed from any point |
+| `interrupt()` + `Command` | Pauses the graph at human escalation; resumes with `new Command({ resume: decision })` when the user runs `maiker resume --decision replan` |
+| `RetryPolicy` | Automatic retry with exponential backoff and jitter on LLM-calling nodes (plan, execute, repair, post-approval review) |
 
 We use LangGraph for the **graph structure, state management, and checkpointing**. The actual AI calls go through our own provider adapters (not LangChain's LLM classes), keeping model routing independent and swappable.
+
+### Resilience features
+
+| Feature | What it does |
+|---------|-------------|
+| **Error classification** | `classifyError()` in `src/types/` categorises errors (transient, auth, validation, resource, dependency, code_generation) and routes each to the right recovery strategy (retry, repair, escalate, replan) |
+| **State mutex** | In-process per-runId lock prevents race conditions when parallel subtasks (`Promise.allSettled`) write to `state.json` concurrently |
+| **Non-Claude file writing** | Code and repair agents extract `files: [{path, content}]` from non-Claude provider responses and write them to disk, so OpenAI/Gemini agents can modify files without tool-use |
+| **Durable checkpoints** | `SqliteSaver` persists to `.maiker/checkpoints.db` instead of in-memory, so runs survive crashes and restarts |
+| **Word-boundary context matching** | Context impact analysis uses regex word boundaries (`\bdo not\b`) instead of substring matching, preventing false triggers on words like "also" appearing inside other words |
+
+### Detailed Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              USER / DEVELOPER                                │
+│                                                                              │
+│   maiker init          maiker run . --goal "..."       maiker resume         │
+│   maiker inspect .     maiker validate .               maiker context add    │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           CLI LAYER  (Commander.js)                           │
+│                                                                              │
+│   src/cli/commands/     src/cli/preflight.ts     src/cli/output/             │
+│   ├── init.ts           ├── Key validation       ├── Terminal tables          │
+│   ├── run.ts            ├── Model routing table   ├── Spinner + progress     │
+│   ├── resume.ts         └── Y/n/e confirmation    └── Event display          │
+│   ├── status.ts                                                              │
+│   ├── logs.ts                                                                │
+│   └── context.ts                                                             │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    ORCHESTRATOR  (LangGraph StateGraph)                       │
+│                    src/core/orchestrator/index.ts                             │
+│                                                                              │
+│   ┌─────────┐    ┌─────────┐    ┌──────────┐    ┌────────┐    ┌─────────┐  │
+│   │  INIT   │───▶│ INSPECT │───▶│ CLASSIFY │───▶│  PLAN  │───▶│ EXECUTE │  │
+│   └─────────┘    └─────────┘    └──────────┘    └────────┘    └────┬────┘  │
+│                                                  ▲  ▲              │        │
+│                                    auto-replan ──┘  │              ▼        │
+│                                                     │    ┌────────────────┐ │
+│                                                     │    │   VALIDATE     │ │
+│                                                     │    │ DETERMINISTIC  │ │
+│                                                     │    └───┬────────┬───┘ │
+│                                                     │   pass │        │fail │
+│                                                     │        ▼        ▼     │
+│   ┌──────────┐    ┌──────────┐    ┌─────────┐    ┌──────┐  ┌──────────┐   │
+│   │   DONE   │◀───│ PROMOTE  │◀───│POST_APPR│◀───│VISUAL│  │  REPAIR  │   │
+│   └──────────┘    └──────────┘    │  REVIEW  │    │VALID │  └────┬─────┘   │
+│                                   └──────────┘    └──────┘       │         │
+│   ┌──────────┐    ┌──────────┐                           ┌───────┘         │
+│   │  FAILED  │    │ BLOCKED  │◀── HUMAN_ESCALATION ◀─────┘ budget          │
+│   └──────────┘    └──────────┘    (interrupt())        exhausted            │
+│                                                                              │
+│   Persistence: SqliteSaver → .maiker/checkpoints.db                         │
+│   Retry: RetryPolicy { maxAttempts: 3, backoff: 2x, jitter: true }         │
+│   Resume: Command({ resume: 'proceed' | 'replan' | 'abort' })              │
+│   State mutex: per-runId lock for parallel safety                            │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           AGENT LAYER                                        │
+│                                                                              │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│   │   Research    │  │   Planner    │  │    Coder     │  │   Repair     │   │
+│   │   Agent       │  │   Agent      │  │   Agent      │  │   Agent      │   │
+│   │              │  │              │  │              │  │              │   │
+│   │ Large ctx,   │  │ Reasoning,   │  │ Code quality │  │ Attempt #,   │   │
+│   │ analysis     │  │ dep graph    │  │ parallel     │  │ history,     │   │
+│   │              │  │              │  │ waves        │  │ diff strategy│   │
+│   └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘   │
+│          │                 │                 │                 │            │
+│   ┌──────────────┐  ┌──────────────┐                                       │
+│   │Visual Review │  │ Post-Approval│    src/agents/shared/                  │
+│   │   Agent      │  │   Review     │    ├── base.ts      (provider router)  │
+│   │              │  │              │    ├── tool-loop.ts  (multi-turn loop)  │
+│   │ Multimodal,  │  │ Fast, cheap, │    └── tools.ts     (read/write/run)   │
+│   │ screenshots  │  │ regression   │                                        │
+│   └──────┬───────┘  └──────┬───────┘                                       │
+│          │                 │                                                │
+└──────────┼─────────────────┼────────────────────────────────────────────────┘
+           │                 │
+           ▼                 ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        PROVIDER LAYER                                        │
+│                                                                              │
+│   ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐        │
+│   │  Claude     │   │  OpenAI    │   │  Gemini    │   │  pi-mono   │        │
+│   │ (Anthropic) │   │            │   │ (Google)   │   │ (internal) │        │
+│   │             │   │            │   │            │   │            │        │
+│   │ Tool-use    │   │ Tool-use   │   │ Tool-use   │   │            │        │
+│   │ native      │   │ + file     │   │ + file     │   │            │        │
+│   │             │   │ extraction │   │ extraction │   │            │        │
+│   └─────────────┘   └────────────┘   └────────────┘   └────────────┘        │
+│                                                                              │
+│   Error Classification: classifyError()                                      │
+│   transient → retry │ auth → escalate │ validation → repair │ resource → esc│
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                          TOOL LAYER                                          │
+│                                                                              │
+│   Shell runner          Git                   Package manager                │
+│   ├── execFile          ├── status, diff      ├── build                     │
+│   └── spawn             ├── worktree          ├── lint, typecheck           │
+│                         ├── checkpoints       ├── unit tests                │
+│   Filesystem            └── rollback          └── integration tests         │
+│   ├── glob, read                                                            │
+│   └── summariseRepo     Playwright                                          │
+│       (cached)          ├── E2E runner                                      │
+│                         └── screenshot capture                              │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                       VALIDATION ENGINE                                      │
+│                                                                              │
+│   Deterministic                          Visual                              │
+│   ├── install    ─┐                      ├── screenshot_capture              │
+│   ├── build       │                      ├── visual_review (AI)              │
+│   ├── lint        ├─▶ per-validator      ├── ux_rules                       │
+│   ├── typecheck   │   issues (not        ├── accessibility                  │
+│   ├── unit_tests  │   aggregated)        └── mobile_layout_rules            │
+│   └── e2e tests  ─┘                                                         │
+│                                                                              │
+│   Profiles: auto-selected by task type (mobile-redesign, feature, bugfix..) │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### Run folder — what gets written
 
