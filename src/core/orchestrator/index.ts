@@ -24,7 +24,7 @@ import {
   END,
   START,
 } from '@langchain/langgraph';
-import { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
+import { MemorySaver } from '@langchain/langgraph';
 
 import type {
   WorkflowInput,
@@ -961,7 +961,7 @@ function buildWorkflowGraph() {
 // ─── Workflow Runner ──────────────────────────────────────────────────────────
 
 // Persistent SQLite checkpointer — survives process restarts for durable resume
-const checkpointer = SqliteSaver.fromConnString('.maiker/checkpoints.db');
+const checkpointer = new MemorySaver();
 
 export async function runWorkflow(input: WorkflowInput): Promise<GraphState> {
   const { runId, goal, projectPath, config } = input;

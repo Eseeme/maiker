@@ -71,8 +71,13 @@ sudo -u "$REAL_USER" npm run build
 
 echo ""
 echo -e "  ${BOLD}Step 3/4${RESET} — Linking maiker CLI globally..."
-npm link
+# --ignore-scripts prevents npm from re-running "prepare" (which would rebuild
+# dist/ as root, causing the permission issue that brought you here).
+npm link --ignore-scripts
 chmod +x "$PROJECT_DIR/dist/bin/maiker.js"
+
+# Fix ownership: npm link runs as root, ensure dist/ stays user-owned
+chown -R "$REAL_USER" "$PROJECT_DIR/dist" 2>/dev/null || true
 # Ensure the global symlink and all linked files are accessible
 GLOBAL_BIN=$(npm bin -g 2>/dev/null || echo "/usr/local/bin")
 if [ -f "$GLOBAL_BIN/maiker" ] || [ -L "$GLOBAL_BIN/maiker" ]; then

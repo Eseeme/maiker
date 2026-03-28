@@ -88,22 +88,106 @@ export async function runCodeAgent(
   }
 
   // Fallback for non-Claude providers — parse JSON and write files to disk
-  const raw = await callModel(modelConfig, FALLBACK_SYSTEM_PROMPT, userMessage);
-  const parsed = parseJsonFromResponse<CodeAgentOutput & { files?: { path: string; content: string }[] }>(raw);
+  // Use high maxTokens to avoid truncation of large file content
+  const highTokenConfig = { ...modelConfig, maxTokens: Math.max(modelConfig.maxTokens ?? 8192, 65536) };
+  const raw = await callModel(highTokenConfig, FALLBACK_SYSTEM_PROMPT, userMessage);
 
-  if (parsed.files && parsed.files.length > 0) {
-    for (const file of parsed.files) {
-      const filePath = resolve(input.projectPath, file.path);
-      await fs.ensureDir(dirname(filePath));
-      await fs.writeFile(filePath, file.content, 'utf-8');
-      console.log(`    [coder] write: ${file.path}`);
+  // Try full JSON parse first; if that fails, extract file content from the partial response
+  let changedFiles: string[] = [];
+  let implementationNotes = '';
+  let riskNotes = '';
+
+  try {
+    const parsed = parseJsonFromResponse<CodeAgentOutput & { files?: { path: string; content: string }[] }>(raw);
+    changedFiles = parsed.changedFiles;
+    implementationNotes = parsed.implementationNotes;
+    riskNotes = parsed.riskNotes;
+
+    if (parsed.files && parsed.files.length > 0) {
+      for (const file of parsed.files) {
+        const filePath = resolve(input.projectPath, file.path);
+        await fs.ensureDir(dirname(filePath));
+        await fs.writeFile(filePath, file.content, 'utf-8');
+        console.log(`    [coder] write: ${file.path}`);
+      }
+    }
+  } catch {
+    // JSON was truncated — extract what we can from the partial response
+    console.log(`    [coder] JSON truncated, extracting content from partial response...`);
+
+    // Extract the file path from the response
+    const pathMatch = raw.match(/"path"\s*:\s*"([^"]+)"/);
+    const targetPath = pathMatch?.[1] ||
+      (userMessage.match(/File Targets:\s*\n([^\n]+)/)?.[1]?.trim()) ||
+      `research/output-${Date.now()}.md`;
+
+    // Strategy 1: Extract the "content" JSON string value and unescape it
+    // Match from "content": " to the last valid point before truncation
+    const contentStart = raw.indexOf('"content"');
+    let recovered = false;
+
+    if (contentStart >= 0) {
+      // Find the opening quote of the content value
+      const valueStart = raw.indexOf('"', contentStart + '"content"'.length + 1);
+      if (valueStart >= 0) {
+        // Extract everything after the opening quote, up to the end
+        let jsonStr = raw.slice(valueStart + 1);
+        // Remove any trailing incomplete JSON (unmatched quotes, braces)
+        // Find the last complete line of actual content
+        const lastNewline = jsonStr.lastIndexOf('\\n');
+        if (lastNewline > 100) {
+          jsonStr = jsonStr.slice(0, lastNewline);
+        }
+        // Unescape JSON string
+        const content = jsonStr
+          .replace(/\\n/g, '\n')
+          .replace(/\\t/g, '\t')
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, '\\')
+          .replace(/\\r/g, '\r');
+
+        if (content.length > 200) {
+          const filePath = resolve(input.projectPath, targetPath);
+          await fs.ensureDir(dirname(filePath));
+          await fs.writeFile(filePath, content, 'utf-8');
+          console.log(`    [coder] write (recovered): ${targetPath}`);
+          changedFiles = [targetPath];
+          implementationNotes = `Generated ${targetPath} (recovered from truncated response)`;
+          recovered = true;
+        }
+      }
+    }
+
+    // Strategy 2: Find markdown content directly (model may have output it raw)
+    if (!recovered) {
+      const mdMatch = raw.match(/(#\s+.+[\s\S]{200,})/);
+      if (mdMatch) {
+        let mdContent = mdMatch[1];
+        // Clean trailing JSON artifacts
+        const jsonTail = mdContent.lastIndexOf('```');
+        if (jsonTail > 0) mdContent = mdContent.slice(0, jsonTail);
+        // Clean trailing quotes/braces
+        mdContent = mdContent.replace(/["\]}]+\s*$/, '');
+
+        const filePath = resolve(input.projectPath, targetPath);
+        await fs.ensureDir(dirname(filePath));
+        await fs.writeFile(filePath, mdContent, 'utf-8');
+        console.log(`    [coder] write (extracted md): ${targetPath}`);
+        changedFiles = [targetPath];
+        implementationNotes = `Generated ${targetPath} (extracted markdown from response)`;
+        recovered = true;
+      }
+    }
+
+    if (!recovered) {
+      throw new Error(`Could not extract any file content from model response (${raw.length} chars)`);
     }
   }
 
   return {
-    changedFiles: parsed.changedFiles,
-    implementationNotes: parsed.implementationNotes,
-    riskNotes: parsed.riskNotes,
+    changedFiles,
+    implementationNotes,
+    riskNotes,
   };
 }
 

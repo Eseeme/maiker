@@ -4,22 +4,21 @@
   "description": "mAIker — a local-first AI product engineering CLI",
   "type": "module",
   "bin": {
-    "maiker": "./dist/bin/maiker.js"
+    "maiker": "./out/bin/maiker.js"
   },
   "scripts": {
     "build": "tsc",
     "build:watch": "tsc --watch",
     "dev": "tsx bin/maiker.ts",
-    "start": "node dist/bin/maiker.js",
+    "start": "node out/bin/maiker.js",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "clean": "rm -rf dist || true",
+    "clean": "rm -rf out || true",
     "prebuild": "npm run clean",
-    "prepare": "npm run build",
-    "link:local": "npm run build && npm link",
-    "setup": "sudo rm -rf node_modules dist package-lock.json || true && npm install --legacy-peer-deps && npm run build && sudo npm link && sudo chmod +x /usr/local/bin/maiker && echo '\\n✓ maiker installed globally. Run: maiker init'"
+    "link:local": "npm run build && sudo npm link --ignore-scripts && sudo chown -R $(whoami) dist/",
+    "setup": "rm -rf node_modules dist package-lock.json || true && npm install --legacy-peer-deps && npm run build && sudo npm link --ignore-scripts && sudo chmod +x /usr/local/bin/maiker && echo '\\n✓ maiker installed globally. Run: maiker init'"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

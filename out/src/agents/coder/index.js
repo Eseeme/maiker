@@ -1,0 +1,207 @@
+import { runToolLoop } from '../shared/tool-loop.js';
+import { callModel, parseJsonFromResponse } from '../shared/base.js';
+import fs from 'fs-extra';
+import { resolve, dirname } from 'path';
+const TOOL_SYSTEM_PROMPT = `You are the Code Agent for mAIker.
+You have tools to read files, write files, list directories, and run commands.
+
+Your job:
+1. Read the existing project to understand the codebase
+2. Implement the subtask by writing/modifying actual files
+3. Use write_file to create or update each file
+4. Verify your work (e.g., list the directory to confirm files were created)
+
+Rules:
+- Implement ONLY the current subtask
+- Respect no-touch constraints and acceptance criteria
+- Prefer minimal blast radius — change only what's needed
+- Do not refactor unrelated files
+- Do not weaken tests to make them pass
+- Actually write the files — do not just describe what you would do
+
+When you are finished writing all files, respond with a brief summary of what you implemented.`;
+const FALLBACK_SYSTEM_PROMPT = `You are the Code Agent for mAIker.
+Implement only the current subtask.
+Respect no-touch constraints and acceptance criteria.
+Prefer minimal blast radius.
+Do not refactor unrelated files.
+Do not weaken tests to make them pass.
+
+You MUST return the COMPLETE file contents for every file you create or modify.
+
+Return a JSON object with this exact shape:
+{
+  "changedFiles": ["relative/path/to/file.ts"],
+  "files": [
+    {
+      "path": "relative/path/to/file.ts",
+      "content": "the FULL file content to write to disk"
+    }
+  ],
+  "implementationNotes": "string describing what was changed and why",
+  "riskNotes": "string describing any risks introduced"
+}
+
+IMPORTANT:
+- "files" must contain one entry for every path listed in "changedFiles"
+- "content" must be the COMPLETE file content, not a diff or partial snippet
+- Return ONLY the JSON object.`;
+export async function runCodeAgent(input, config) {
+    const modelConfig = config.models.codeGeneration;
+    const userMessage = buildUserMessage(input);
+    // Use tool loop for Claude — actually writes files to disk
+    if (modelConfig.provider === 'claude') {
+        const result = await runToolLoop({
+            modelConfig,
+            systemPrompt: TOOL_SYSTEM_PROMPT,
+            userMessage,
+            projectPath: input.projectPath,
+            onToolCall: (name, toolInput) => {
+                if (name === 'write_file') {
+                    console.log(`    [coder] write: ${toolInput.path}`);
+                }
+                else if (name === 'read_file') {
+                    console.log(`    [coder] read: ${toolInput.path}`);
+                }
+                else if (name === 'run_command') {
+                    console.log(`    [coder] run: ${toolInput.command}`);
+                }
+            },
+        });
+        return {
+            changedFiles: result.changedFiles,
+            implementationNotes: result.finalText || `Created ${result.changedFiles.length} file(s) with ${result.toolCallCount} tool calls`,
+            riskNotes: '',
+        };
+    }
+    // Fallback for non-Claude providers — parse JSON and write files to disk
+    // Use high maxTokens to avoid truncation of large file content
+    const highTokenConfig = { ...modelConfig, maxTokens: Math.max(modelConfig.maxTokens ?? 8192, 65536) };
+    const raw = await callModel(highTokenConfig, FALLBACK_SYSTEM_PROMPT, userMessage);
+    // Try full JSON parse first; if that fails, extract file content from the partial response
+    let changedFiles = [];
+    let implementationNotes = '';
+    let riskNotes = '';
+    try {
+        const parsed = parseJsonFromResponse(raw);
+        changedFiles = parsed.changedFiles;
+        implementationNotes = parsed.implementationNotes;
+        riskNotes = parsed.riskNotes;
+        if (parsed.files && parsed.files.length > 0) {
+            for (const file of parsed.files) {
+                const filePath = resolve(input.projectPath, file.path);
+                await fs.ensureDir(dirname(filePath));
+                await fs.writeFile(filePath, file.content, 'utf-8');
+                console.log(`    [coder] write: ${file.path}`);
+            }
+        }
+    }
+    catch {
+        // JSON was truncated — extract what we can from the partial response
+        console.log(`    [coder] JSON truncated, extracting content from partial response...`);
+        // Extract the file path from the response
+        const pathMatch = raw.match(/"path"\s*:\s*"([^"]+)"/);
+        const targetPath = pathMatch?.[1] ||
+            (userMessage.match(/File Targets:\s*\n([^\n]+)/)?.[1]?.trim()) ||
+            `research/output-${Date.now()}.md`;
+        // Strategy 1: Extract the "content" JSON string value and unescape it
+        // Match from "content": " to the last valid point before truncation
+        const contentStart = raw.indexOf('"content"');
+        let recovered = false;
+        if (contentStart >= 0) {
+            // Find the opening quote of the content value
+            const valueStart = raw.indexOf('"', contentStart + '"content"'.length + 1);
+            if (valueStart >= 0) {
+                // Extract everything after the opening quote, up to the end
+                let jsonStr = raw.slice(valueStart + 1);
+                // Remove any trailing incomplete JSON (unmatched quotes, braces)
+                // Find the last complete line of actual content
+                const lastNewline = jsonStr.lastIndexOf('\\n');
+                if (lastNewline > 100) {
+                    jsonStr = jsonStr.slice(0, lastNewline);
+                }
+                // Unescape JSON string
+                const content = jsonStr
+                    .replace(/\\n/g, '\n')
+                    .replace(/\\t/g, '\t')
+                    .replace(/\\"/g, '"')
+                    .replace(/\\\\/g, '\\')
+                    .replace(/\\r/g, '\r');
+                if (content.length > 200) {
+                    const filePath = resolve(input.projectPath, targetPath);
+                    await fs.ensureDir(dirname(filePath));
+                    await fs.writeFile(filePath, content, 'utf-8');
+                    console.log(`    [coder] write (recovered): ${targetPath}`);
+                    changedFiles = [targetPath];
+                    implementationNotes = `Generated ${targetPath} (recovered from truncated response)`;
+                    recovered = true;
+                }
+            }
+        }
+        // Strategy 2: Find markdown content directly (model may have output it raw)
+        if (!recovered) {
+            const mdMatch = raw.match(/(#\s+.+[\s\S]{200,})/);
+            if (mdMatch) {
+                let mdContent = mdMatch[1];
+                // Clean trailing JSON artifacts
+                const jsonTail = mdContent.lastIndexOf('```');
+                if (jsonTail > 0)
+                    mdContent = mdContent.slice(0, jsonTail);
+                // Clean trailing quotes/braces
+                mdContent = mdContent.replace(/["\]}]+\s*$/, '');
+                const filePath = resolve(input.projectPath, targetPath);
+                await fs.ensureDir(dirname(filePath));
+                await fs.writeFile(filePath, mdContent, 'utf-8');
+                console.log(`    [coder] write (extracted md): ${targetPath}`);
+                changedFiles = [targetPath];
+                implementationNotes = `Generated ${targetPath} (extracted markdown from response)`;
+                recovered = true;
+            }
+        }
+        if (!recovered) {
+            throw new Error(`Could not extract any file content from model response (${raw.length} chars)`);
+        }
+    }
+    return {
+        changedFiles,
+        implementationNotes,
+        riskNotes,
+    };
+}
+function buildUserMessage(input) {
+    return `
+Goal: ${input.goal}
+Project: ${input.projectPath}
+
+Current Subtask:
+ID: ${input.subtask.id}
+Title: ${input.subtask.title}
+Description: ${input.subtask.description}
+
+File Targets:
+${input.fileTargets.join('\n') || 'Not specified — use your best judgment'}
+
+Acceptance Criteria:
+${input.acceptanceCriteria.map((c) => `- ${c}`).join('\n')}
+
+No-Touch Constraints:
+${input.noTouchConstraints.map((c) => `- ${c}`).join('\n') || 'None specified'}
+
+Repository Context:
+${input.repoContext}
+
+Additional Context:
+${input.context ?? 'None'}
+
+${input.sharedContext && input.sharedContext.completedNotes.length > 0 ? `
+Previously Completed Subtasks (context from parallel execution):
+${input.sharedContext.completedNotes.map(n => `- [${n.subtaskId}] ${n.title}: ${n.notes}`).join('\n')}
+
+Files already changed by other subtasks:
+${input.sharedContext.changedFiles.join('\n') || 'None yet'}
+` : ''}
+
+Implement the subtask now. Use the tools to read existing files, then write your changes.
+`.trim();
+}
+//# sourceMappingURL=index.js.map

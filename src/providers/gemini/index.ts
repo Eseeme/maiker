@@ -34,6 +34,7 @@ export async function geminiChat(
   const model = genAI.getGenerativeModel({
     model: config.model,
     systemInstruction: systemPrompt,
+    generationConfig: config.maxTokens ? { maxOutputTokens: config.maxTokens } : undefined,
   });
 
   const history = messages.slice(0, -1).map((m) => ({

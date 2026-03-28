@@ -1,0 +1,46 @@
+import Anthropic from '@anthropic-ai/sdk';
+let client = null;
+function getClient() {
+    if (!client) {
+        const apiKey = process.env.ANTHROPIC_API_KEY;
+        if (!apiKey) {
+            throw new Error('ANTHROPIC_API_KEY is not set. Please add it to your .env file.');
+        }
+        // OAuth tokens (sk-ant-oat*) require authToken, not apiKey
+        if (apiKey.startsWith('sk-ant-oat')) {
+            client = new Anthropic({ authToken: apiKey, apiKey: null });
+        }
+        else {
+            client = new Anthropic({ apiKey });
+        }
+    }
+    return client;
+}
+export async function claudeChat(config, systemPrompt, messages) {
+    const anthropic = getClient();
+    const response = await anthropic.messages.create({
+        model: config.model,
+        max_tokens: config.maxTokens ?? 8192,
+        system: systemPrompt,
+        messages: messages.map((m) => ({
+            role: m.role,
+            content: m.content,
+        })),
+    });
+    const content = response.content[0]?.type === 'text' ? response.content[0].text : '';
+    return {
+        content,
+        model: response.model,
+        usage: {
+            inputTokens: response.usage.input_tokens,
+            outputTokens: response.usage.output_tokens,
+        },
+    };
+}
+export async function claudeComplete(config, systemPrompt, userMessage) {
+    const resp = await claudeChat(config, systemPrompt, [
+        { role: 'user', content: userMessage },
+    ]);
+    return resp.content;
+}
+//# sourceMappingURL=index.js.map

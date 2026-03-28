@@ -1,0 +1,25 @@
+import type { RunState, JobSpec, WorkflowStage, RunStatus, Issue, ContextUpdate, ValidationResult, TaskClassification, ExecutionPlan, RepoInspection, ContextImpact } from '../../types/index.js';
+export declare const RUNS_DIR = ".maiker/runs";
+export declare function generateRunId(): string;
+export declare function getRunDir(runId: string, baseDir?: string): string;
+export declare function initRunFolder(runId: string, goal: string, projectPath: string, configPath: string, baseDir?: string): Promise<string>;
+export declare function loadRunState(runId: string, baseDir?: string): Promise<RunState>;
+export declare function loadJobSpec(runId: string, baseDir?: string): Promise<JobSpec>;
+export declare function updateRunState(runId: string, patch: Partial<RunState>, baseDir?: string): Promise<RunState>;
+export declare function setStage(runId: string, stage: WorkflowStage, baseDir?: string): Promise<void>;
+export declare function setStatus(runId: string, status: RunStatus, baseDir?: string): Promise<void>;
+export declare function setAgent(runId: string, agent: string, action: string, baseDir?: string): Promise<void>;
+export declare function incrementRetry(runId: string, key: string, baseDir?: string): Promise<number>;
+export declare function saveInspection(runId: string, inspection: RepoInspection, baseDir?: string): Promise<void>;
+export declare function saveClassification(runId: string, classification: TaskClassification, baseDir?: string): Promise<void>;
+export declare function savePlan(runId: string, plan: ExecutionPlan, baseDir?: string): Promise<void>;
+export declare function addIssue(runId: string, issue: Issue, baseDir?: string): Promise<void>;
+export declare function resolveIssue(runId: string, issueId: string, baseDir?: string): Promise<void>;
+export declare function getOpenIssues(runId: string, baseDir?: string): Promise<Issue[]>;
+export declare function addContextUpdate(runId: string, message: string, impact: ContextImpact, baseDir?: string): Promise<ContextUpdate>;
+export declare function getContextUpdates(runId: string, baseDir?: string): Promise<ContextUpdate[]>;
+export declare function appendValidationResult(runId: string, result: ValidationResult, baseDir?: string): Promise<void>;
+export declare function listRuns(baseDir?: string): Promise<RunState[]>;
+export declare function getLatestRun(baseDir?: string): Promise<RunState | null>;
+export declare function findRun(runIdOrPartial: string, baseDir?: string): Promise<RunState | null>;
+//# sourceMappingURL=index.d.ts.map
