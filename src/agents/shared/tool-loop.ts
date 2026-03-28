@@ -46,7 +46,12 @@ function getClient(): Anthropic {
   if (!cachedClient) {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set.');
-    cachedClient = new Anthropic({ apiKey });
+    // OAuth tokens (sk-ant-oat*) require authToken, not apiKey
+    if (apiKey.startsWith('sk-ant-oat')) {
+      cachedClient = new Anthropic({ authToken: apiKey, apiKey: null });
+    } else {
+      cachedClient = new Anthropic({ apiKey });
+    }
   }
   return cachedClient;
 }

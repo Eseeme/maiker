@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { banner, success, fail } from '../output/index.js';
+import { banner, success, fail, info } from '../output/index.js';
 import {
   detectAvailableProviders,
   validateProviderKey,
@@ -10,11 +10,14 @@ import {
 import type { AgentRole } from '../../core/models/index.js';
 import { loadConfig } from '../../config/index.js';
 import type { ModelConfig } from '../../types/index.js';
-import { detectOAuthToken } from '../oauth.js';
+import { detectOAuthToken, applyOAuthToken } from '../oauth.js';
 
 export function createAuthCommand(): Command {
-  return new Command('auth')
-    .description('Check API key status and provider connectivity')
+  const auth = new Command('auth')
+    .description('Check API key status, provider connectivity, and manage OAuth');
+
+  // ── maiker auth (default: status) ──────────────────────────────────────────
+  auth
     .option('--validate', 'Test each key with a real API call')
     .option('--config <path>', 'Path to maiker.config.yaml')
     .action(async (opts: { validate?: boolean; config?: string }) => {
@@ -24,21 +27,7 @@ export function createAuthCommand(): Command {
       console.log(chalk.gray('  ────────────────────────────────────────'));
       console.log('');
 
-      // ── Detect env keys ──────────────────────────────────────────────
-      const providers = detectAvailableProviders();
-
-      console.log(chalk.bold('  API Keys'));
-      console.log('');
-
-      for (const p of providers) {
-        const status = p.available
-          ? chalk.green('✓ found')
-          : chalk.gray('✗ not set');
-        console.log(`    ${p.provider.padEnd(10)} ${p.envVar.padEnd(22)} ${status}`);
-      }
-
       // ── Claude Code OAuth ────────────────────────────────────────────
-      console.log('');
       console.log(chalk.bold('  Claude Code OAuth'));
       console.log('');
 
@@ -61,11 +50,28 @@ export function createAuthCommand(): Command {
           }
         } else {
           console.log(`    ${chalk.red('✗')} OAuth token expired (${Math.abs(oauth.hoursLeft ?? 0).toFixed(1)} hours ago)`);
-          console.log(`    ${chalk.gray('Fix:')} ${chalk.cyan('claude auth login')}`);
+          console.log(`    ${chalk.gray('Fix:')} ${chalk.cyan('maiker auth refresh')}  or  ${chalk.cyan('claude auth login')}`);
         }
       } else {
         console.log(`    ${chalk.gray('✗')} ${oauth.error ?? 'No OAuth token found'}`);
         console.log(`    ${chalk.gray('To set up:')} ${chalk.cyan('claude auth login')}`);
+      }
+
+      // ── Detect env keys ──────────────────────────────────────────────
+      console.log('');
+      console.log(chalk.bold('  API Keys'));
+      console.log('');
+
+      const providers = detectAvailableProviders();
+
+      for (const p of providers) {
+        if (p.available && p.source === 'oauth') {
+          console.log(`    ${p.provider.padEnd(10)} ${p.envVar.padEnd(22)} ${chalk.green('✓ via OAuth')}`);
+        } else if (p.available) {
+          console.log(`    ${p.provider.padEnd(10)} ${p.envVar.padEnd(22)} ${chalk.green('✓ found')}`);
+        } else {
+          console.log(`    ${p.provider.padEnd(10)} ${p.envVar.padEnd(22)} ${chalk.gray('✗ not set')}`);
+        }
       }
 
       // ── Validate keys (optional) ────────────────────────────────────
@@ -136,4 +142,68 @@ export function createAuthCommand(): Command {
 
       console.log('');
     });
+
+  // ── maiker auth refresh ────────────────────────────────────────────────────
+  auth
+    .command('refresh')
+    .description('Re-detect Claude Code OAuth token and apply it')
+    .action(async () => {
+      banner();
+
+      console.log(chalk.bold('  Refreshing Authentication'));
+      console.log(chalk.gray('  ────────────────────────────────────────'));
+      console.log('');
+
+      // Re-detect OAuth token from Claude Code credentials
+      const oauth = detectOAuthToken();
+
+      if (!oauth.found || !oauth.token) {
+        fail('No Claude Code OAuth token found');
+        console.log('');
+        console.log(chalk.gray('  Claude Code is not logged in, or credentials file is missing.'));
+        console.log('');
+        console.log(chalk.gray('  To fix:'));
+        console.log(`    1. Install Claude Code:  ${chalk.cyan('npm install -g @anthropic-ai/claude-code')}`);
+        console.log(`    2. Log in:               ${chalk.cyan('claude auth login')}`);
+        console.log(`    3. Re-run:               ${chalk.cyan('maiker auth refresh')}`);
+        console.log('');
+        return;
+      }
+
+      if (oauth.hoursLeft !== undefined && oauth.hoursLeft <= 0) {
+        fail(`OAuth token expired ${Math.abs(oauth.hoursLeft).toFixed(1)} hours ago`);
+        console.log('');
+        console.log(chalk.gray('  Your Claude Code session has expired.'));
+        console.log(`  Run ${chalk.cyan('claude auth login')} to get a new token, then ${chalk.cyan('maiker auth refresh')}`);
+        console.log('');
+        return;
+      }
+
+      // Apply the token to the current process
+      applyOAuthToken();
+
+      const sourceLabel = oauth.source === 'keychain' ? 'macOS Keychain' : 'credentials file';
+      success(`OAuth token refreshed from ${sourceLabel}`);
+      console.log(`    ${chalk.gray('Expires in:')} ${oauth.hoursLeft!.toFixed(1)} hours`);
+      console.log(`    ${chalk.gray('Token type:')} Claude Code OAuth (${oauth.token.slice(0, 16)}...)`);
+      console.log('');
+
+      // Validate the token actually works
+      process.stdout.write(`    Validating token... `);
+      const result = await validateProviderKey('claude');
+      if (result.valid) {
+        console.log(chalk.green('✓ connected'));
+      } else {
+        console.log(chalk.red(`✗ ${result.error}`));
+        console.log('');
+        console.log(chalk.gray('  Token was found but failed validation.'));
+        console.log(`  Try: ${chalk.cyan('claude auth login')} to get a fresh token.`);
+      }
+
+      console.log('');
+      info('OAuth is auto-detected every time you run maiker. No need to refresh unless troubleshooting.');
+      console.log('');
+    });
+
+  return auth;
 }

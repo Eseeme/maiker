@@ -17,6 +17,8 @@ import { createResumeCommand } from './commands/resume.js';
 import { createContextCommand } from './commands/context.js';
 import { createArtifactsCommand } from './commands/artifacts.js';
 import { createAuthCommand } from './commands/auth.js';
+import { createSelfcheckCommand } from './commands/selfcheck.js';
+import { createReviewCycleCommand } from './commands/review-cycle.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -43,6 +45,7 @@ export function createCLI(): Command {
 Examples:
   $ maiker init
   $ maiker auth                          # check API keys & OAuth status
+  $ maiker auth refresh                  # re-detect Claude Code OAuth token
   $ maiker auth --validate               # test API connectivity
   $ maiker run ./app --goal "Make dashboard mobile responsive"
   $ maiker status                        # show latest run status
@@ -67,6 +70,8 @@ Examples:
   program.addCommand(createContextCommand());
   program.addCommand(createArtifactsCommand());
   program.addCommand(createAuthCommand());
+  program.addCommand(createSelfcheckCommand());
+  program.addCommand(createReviewCycleCommand());
 
   // Error handling
   program.exitOverride();
@@ -83,8 +88,17 @@ export async function runCLI(argv: string[] = process.argv): Promise<void> {
 
   // Auto-detect Claude Code OAuth token (macOS Keychain or Linux JSON file)
   // Always prefer a fresh OAuth token over a stale one from .env
-  const { applyOAuthToken } = await import('./oauth.js');
-  applyOAuthToken();
+  try {
+    const { applyOAuthToken } = await import('./oauth.js');
+    applyOAuthToken();
+  } catch (err) {
+    // OAuth module missing from build — warn so users know detection failed
+    console.error(
+      '[maiker] Warning: OAuth detection module not found. Run: cd ' +
+      'maiker && npm run build\n' +
+      '  Claude Code OAuth auto-detect is disabled. Set ANTHROPIC_API_KEY in .env instead.',
+    );
+  }
 
   const program = createCLI();
 

@@ -22,7 +22,13 @@ function getClient(): Anthropic {
         'ANTHROPIC_API_KEY is not set. Please add it to your .env file.',
       );
     }
-    client = new Anthropic({ apiKey });
+
+    // OAuth tokens (sk-ant-oat*) require authToken, not apiKey
+    if (apiKey.startsWith('sk-ant-oat')) {
+      client = new Anthropic({ authToken: apiKey, apiKey: null });
+    } else {
+      client = new Anthropic({ apiKey });
+    }
   }
   return client;
 }

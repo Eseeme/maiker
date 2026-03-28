@@ -423,6 +423,18 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
           };
           console.warn(`[maiker] ✗ ${subtask.id} [${classified.category}]: ${classified.message}`);
           emitAgentCompleted(state.runId, 'coder');
+
+          // Auth errors — abort all execution immediately
+          if (classified.category === 'auth') {
+            emitStageCompleted(state.runId, 'EXECUTE');
+            return {
+              stage: 'FAILED' as WorkflowStage,
+              status: 'failed' as RunStatus,
+              error: `Auth error during execution: ${classified.message}`,
+              subtaskStates,
+              sharedContext,
+            };
+          }
         }
       }
     }
@@ -620,26 +632,33 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
     return { stage: 'VALIDATE_DETERMINISTIC' as WorkflowStage, status: 'running' as RunStatus };
   }
 
-  // Check escalation
-  for (const issue of openIssues) {
-    if (shouldEscalate(issue.id, state.retryCounts, state.config.policies)) {
-      if (shouldAutoReplan(state.retryCounts, state.config.policies)) {
-        console.log('[maiker] Auto-replan triggered — repair budget partially exhausted');
-        emitStageCompleted(state.runId, 'REPAIR');
-        return { stage: 'PLAN' as WorkflowStage, status: 'running' as RunStatus };
-      }
-      emitStageCompleted(state.runId, 'REPAIR');
-      return { stage: 'HUMAN_ESCALATION' as WorkflowStage, status: 'running' as RunStatus };
-    }
-  }
-
-  // Increment counters
+  // Increment counters FIRST — before escalation check and before repair agent call,
+  // so counts accumulate even when the repair agent throws (e.g. auth 401)
   const runRetry = await incrementRetry(state.runId, 'run');
   const issueAttempts: Record<string, number> = {};
   for (const issue of openIssues) {
     const count = await incrementRetry(state.runId, `issue:${issue.id}`);
     issueAttempts[issue.id] = count;
     issue.attempts = count;
+  }
+
+  // Build updated retry counts for graph state
+  const updatedRetryCounts: Record<string, number> = { ...state.retryCounts, run: runRetry };
+  for (const issue of openIssues) {
+    updatedRetryCounts[`issue:${issue.id}`] = issueAttempts[issue.id];
+  }
+
+  // Check escalation (now with up-to-date counts)
+  for (const issue of openIssues) {
+    if (shouldEscalate(issue.id, updatedRetryCounts, state.config.policies)) {
+      if (shouldAutoReplan(updatedRetryCounts, state.config.policies)) {
+        console.log('[maiker] Auto-replan triggered — repair budget partially exhausted');
+        emitStageCompleted(state.runId, 'REPAIR');
+        return { stage: 'PLAN' as WorkflowStage, status: 'running' as RunStatus, retryCounts: updatedRetryCounts };
+      }
+      emitStageCompleted(state.runId, 'REPAIR');
+      return { stage: 'HUMAN_ESCALATION' as WorkflowStage, status: 'running' as RunStatus, retryCounts: updatedRetryCounts };
+    }
   }
 
   // Progress tracking
@@ -681,11 +700,6 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
 
     emitStageCompleted(state.runId, 'REPAIR');
 
-    const updatedRetryCounts: Record<string, number> = { ...state.retryCounts, run: runRetry };
-    for (const issue of openIssues) {
-      updatedRetryCounts[`issue:${issue.id}`] = issueAttempts[issue.id];
-    }
-
     return {
       stage: 'VALIDATE_DETERMINISTIC' as WorkflowStage,
       retryCounts: updatedRetryCounts,
@@ -701,7 +715,7 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
     if (classified.category === 'auth') {
       return {
         stage: 'HUMAN_ESCALATION' as WorkflowStage,
-        retryCounts: { ...state.retryCounts, run: runRetry },
+        retryCounts: updatedRetryCounts,
         repairHistory: [`[attempt ${runRetry}] AUTH FAILURE: ${classified.message}`],
         status: 'running' as RunStatus,
       };
@@ -709,7 +723,7 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
 
     return {
       stage: 'VALIDATE_DETERMINISTIC' as WorkflowStage,
-      retryCounts: { ...state.retryCounts, run: runRetry },
+      retryCounts: updatedRetryCounts,
       repairHistory: [`[attempt ${runRetry}] FAILED [${classified.category}]: ${classified.message}`],
       status: 'running' as RunStatus,
     };

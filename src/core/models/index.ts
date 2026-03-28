@@ -77,6 +77,8 @@ export interface ProviderAvailability {
   provider: string;
   envVar: string;
   available: boolean;
+  /** How the key was obtained: 'env' (from .env), 'oauth' (Claude Code login), or undefined */
+  source?: 'env' | 'oauth';
 }
 
 const PROVIDER_ENV_VARS: Record<string, string> = {
@@ -87,11 +89,15 @@ const PROVIDER_ENV_VARS: Record<string, string> = {
 
 /** Check which providers have API keys set in environment */
 export function detectAvailableProviders(): ProviderAvailability[] {
-  return Object.entries(PROVIDER_ENV_VARS).map(([provider, envVar]) => ({
-    provider,
-    envVar,
-    available: !!process.env[envVar]?.trim(),
-  }));
+  return Object.entries(PROVIDER_ENV_VARS).map(([provider, envVar]) => {
+    const value = process.env[envVar]?.trim();
+    const available = !!value;
+    let source: 'env' | 'oauth' | undefined;
+    if (available) {
+      source = value!.startsWith('sk-ant-oat') ? 'oauth' : 'env';
+    }
+    return { provider, envVar, available, source };
+  });
 }
 
 /** Get list of provider names that have valid keys */
@@ -182,7 +188,11 @@ export async function validateProviderKey(provider: string): Promise<{ valid: bo
     switch (provider) {
       case 'claude': {
         const { default: Anthropic } = await import('@anthropic-ai/sdk');
-        const client = new Anthropic();
+        const apiKey = process.env.ANTHROPIC_API_KEY ?? '';
+        // OAuth tokens use authToken, regular keys use apiKey
+        const client = apiKey.startsWith('sk-ant-oat')
+          ? new Anthropic({ authToken: apiKey, apiKey: undefined as unknown as string })
+          : new Anthropic();
         // Minimal request — will fail fast if key is invalid
         await client.messages.create({
           model: 'claude-haiku-4-5',

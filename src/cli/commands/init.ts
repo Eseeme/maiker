@@ -15,6 +15,7 @@ import {
 } from '../../core/models/index.js';
 import type { AgentRole } from '../../core/models/index.js';
 import type { ModelConfig } from '../../types/index.js';
+import { detectOAuthToken } from '../oauth.js';
 
 function ask(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -56,23 +57,60 @@ export function createInitCommand(): Command {
           const providers = detectAvailableProviders();
           const knownProviders = getKnownProviders();
 
-          console.log(chalk.bold('  Detected API keys:\n'));
+          // ── Claude Code OAuth detection ──
+          const oauth = detectOAuthToken();
+          const oauthActive = oauth.found && oauth.token &&
+            oauth.hoursLeft !== undefined && oauth.hoursLeft > 0;
+
+          console.log(chalk.bold('  Authentication:\n'));
+
+          // Show Claude Code OAuth status first (primary auth method)
+          if (oauthActive) {
+            console.log(`    ${chalk.green('✓')} Claude Code OAuth detected (expires in ${oauth.hoursLeft!.toFixed(1)}h)`);
+            console.log(chalk.gray('      Using your Claude Code login — no API key needed for Claude.\n'));
+          } else if (oauth.found && oauth.hoursLeft !== undefined && oauth.hoursLeft <= 0) {
+            console.log(`    ${chalk.red('✗')} Claude Code OAuth token expired`);
+            console.log(chalk.gray(`      Run: ${chalk.cyan('claude auth login')} to refresh, or: ${chalk.cyan('maiker auth refresh')}\n`));
+          } else {
+            console.log(`    ${chalk.gray('–')} Claude Code OAuth not detected`);
+            console.log(chalk.gray('      Install Claude Code and run: claude auth login\n'));
+          }
+
+          // Show API key status
+          console.log(chalk.bold('  API Keys:\n'));
           for (const p of providers) {
+            // For claude, skip env var display if OAuth is active
+            if (p.provider === 'claude' && oauthActive) {
+              console.log(`    ${p.provider.padEnd(10)} ${p.envVar.padEnd(22)} ${chalk.green('✓ via OAuth')}`);
+              continue;
+            }
             const status = p.available
-              ? chalk.green('✓ found')
+              ? (p.source === 'oauth'
+                  ? chalk.green('✓ via OAuth')
+                  : chalk.green('✓ found'))
               : chalk.gray('✗ not set');
             console.log(`    ${p.provider.padEnd(10)} ${p.envVar.padEnd(22)} ${status}`);
           }
           console.log('');
 
-          // Ask which providers to enable
+          // Determine available providers
           const availableNames = providers.filter(p => p.available).map(p => p.provider);
 
+          // If OAuth is active but claude wasn't already in the list (edge case),
+          // make sure claude is available
+          if (oauthActive && !availableNames.includes('claude')) {
+            availableNames.push('claude');
+          }
+
           if (availableNames.length === 0) {
-            console.log(chalk.yellow('  No API keys detected in environment.'));
-            console.log(chalk.gray('  Set at least one key in .env and re-run maiker init.\n'));
-            console.log(chalk.gray(`  Providers: ${knownProviders.join(', ')}`));
-            console.log(chalk.gray('  Env vars:  ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY\n'));
+            console.log(chalk.yellow('  No authentication detected.'));
+            console.log('');
+            console.log(chalk.gray('  Option 1: Install Claude Code and log in (recommended):'));
+            console.log(chalk.cyan('    claude auth login'));
+            console.log('');
+            console.log(chalk.gray('  Option 2: Set API keys in .env:'));
+            console.log(chalk.gray(`    Providers: ${knownProviders.join(', ')}`));
+            console.log(chalk.gray('    Env vars:  ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY\n'));
 
             const addNow = await ask('  Add a provider now? Enter provider name or press Enter to skip: ');
             if (addNow && knownProviders.includes(addNow)) {
@@ -83,7 +121,7 @@ export function createInitCommand(): Command {
               availableNames.push('claude');
             } else {
               availableNames.push('claude');
-              console.log(chalk.gray('  Defaulting to claude. Set ANTHROPIC_API_KEY in .env.\n'));
+              console.log(chalk.gray('  Defaulting to claude. Set ANTHROPIC_API_KEY in .env or run: claude auth login\n'));
             }
           }
 

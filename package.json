@@ -13,18 +13,20 @@
     "start": "node dist/bin/maiker.js",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist || true",
     "prebuild": "npm run clean",
     "prepare": "npm run build",
     "link:local": "npm run build && npm link",
-    "setup": "npm install && npm run build && npm link && echo '\\n✓ maiker installed globally. Run: maiker --help'"
+    "setup": "sudo rm -rf node_modules dist package-lock.json || true && npm install --legacy-peer-deps && npm run build && sudo npm link && sudo chmod +x /usr/local/bin/maiker && echo '\\n✓ maiker installed globally. Run: maiker init'"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.0",
+    "@anthropic-ai/sdk": "^0.78.0",
     "@google/generative-ai": "^0.24.1",
     "@langchain/core": "^0.3.0",
     "@langchain/langgraph": "^0.2.0",
-    "@langchain/langgraph-checkpoint-sqlite": "^1.0.1",
+    "@langchain/langgraph-checkpoint-sqlite": "~0.2.1",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
     "dotenv": "^16.4.0",
@@ -44,7 +46,8 @@
     "@types/node": "^22.5.0",
     "@types/uuid": "^10.0.0",
     "tsx": "^4.16.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.2"
   },
   "engines": {
     "node": ">=18.0.0"
