@@ -35,6 +35,21 @@ export async function runToolLoop(opts) {
         throw new Error(`Tool loop currently supports claude provider only (got: ${modelConfig.provider}). ` +
             `Other providers can be added by implementing their tool_use API.`);
     }
+    // OAuth tokens can't call the Messages API directly.
+    // For tool-loop with OAuth, we fall back to non-tool mode via Claude Code subprocess.
+    const apiKey = process.env.ANTHROPIC_API_KEY ?? '';
+    if (apiKey.startsWith('sk-ant-oat')) {
+        // Import and use claude-code subprocess instead
+        const { claudeCodeComplete } = await import('../../providers/claude-code/index.js');
+        const { isClaudeCodeAvailable } = await import('../../providers/claude-code/index.js');
+        if (isClaudeCodeAvailable()) {
+            console.log('    [tool-loop] Using Claude Code subprocess (OAuth detected)');
+            const result = await claudeCodeComplete(modelConfig, systemPrompt, userMessage, projectPath);
+            return { finalText: result, changedFiles: [], toolCallCount: 0 };
+        }
+        throw new Error('OAuth token detected but Claude Code CLI is not available. ' +
+            'Install Claude Code or set a direct ANTHROPIC_API_KEY (not sk-ant-oat*).');
+    }
     const client = getClient();
     const changedFiles = [];
     let toolCallCount = 0;

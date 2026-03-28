@@ -4,9 +4,14 @@ import { geminiComplete } from '../../providers/gemini/index.js';
 import { claudeChat } from '../../providers/claude/index.js';
 import { openaiChat } from '../../providers/openai/index.js';
 import { geminiChat } from '../../providers/gemini/index.js';
+import { shouldUseClaudeCode, claudeCodeComplete, claudeCodeChat } from '../../providers/claude-code/index.js';
 export async function callModel(config, systemPrompt, userMessage) {
     switch (config.provider) {
         case 'claude':
+            // OAuth tokens can't call the Messages API directly — use Claude Code subprocess
+            if (shouldUseClaudeCode()) {
+                return claudeCodeComplete(config, systemPrompt, userMessage);
+            }
             return claudeComplete(config, systemPrompt, userMessage);
         case 'openai':
             return openaiComplete(config, systemPrompt, userMessage);
@@ -26,6 +31,11 @@ export async function callModel(config, systemPrompt, userMessage) {
 export async function callModelWithMessages(config, systemPrompt, messages) {
     switch (config.provider) {
         case 'claude': {
+            // OAuth tokens can't call the Messages API directly — use Claude Code subprocess
+            if (shouldUseClaudeCode()) {
+                const resp = await claudeCodeChat(config, systemPrompt, messages);
+                return resp.content;
+            }
             const resp = await claudeChat(config, systemPrompt, messages);
             return resp.content;
         }

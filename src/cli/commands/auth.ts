@@ -11,6 +11,7 @@ import type { AgentRole } from '../../core/models/index.js';
 import { loadConfig } from '../../config/index.js';
 import type { ModelConfig } from '../../types/index.js';
 import { detectOAuthToken, applyOAuthToken } from '../oauth.js';
+import { shouldUseClaudeCode, isClaudeCodeAvailable } from '../../providers/claude-code/index.js';
 
 export function createAuthCommand(): Command {
   const auth = new Command('auth')
@@ -40,13 +41,17 @@ export function createAuthCommand(): Command {
           console.log(`    ${chalk.green('✓')} OAuth token found (${sourceLabel})`);
           console.log(`    ${chalk.gray('Expires in:')} ${oauth.hoursLeft.toFixed(1)} hours`);
 
-          const currentEnvKey = process.env.ANTHROPIC_API_KEY ?? '';
-          if (currentEnvKey.startsWith('sk-ant-oat')) {
-            console.log(`    ${chalk.green('✓')} Active — being used as ANTHROPIC_API_KEY`);
-          } else if (!currentEnvKey) {
-            console.log(`    ${chalk.green('✓')} Active — will be used (no .env key set)`);
+          // OAuth tokens can't call the Messages API directly.
+          // When detected, maiker routes through Claude Code subprocess.
+          if (shouldUseClaudeCode()) {
+            console.log(`    ${chalk.green('✓')} Active — will route via Claude Code subprocess`);
+            console.log(`    ${chalk.gray('ℹ')} OAuth tokens work through Claude Code CLI, not the API directly`);
+          } else if (isClaudeCodeAvailable()) {
+            console.log(`    ${chalk.green('✓')} Claude Code available (will use for OAuth routing)`);
           } else {
-            console.log(`    ${chalk.gray('ℹ')} Not used — .env has a non-OAuth ANTHROPIC_API_KEY`);
+            console.log(`    ${chalk.yellow('⚠')} Claude Code CLI not found — OAuth tokens need it`);
+            console.log(`    ${chalk.gray('Fix:')} ${chalk.cyan('npm install -g @anthropic-ai/claude-code')}`);
+            console.log(`    ${chalk.gray('  or:')} Set a direct ANTHROPIC_API_KEY in .env`);
           }
         } else {
           console.log(`    ${chalk.red('✗')} OAuth token expired (${Math.abs(oauth.hoursLeft ?? 0).toFixed(1)} hours ago)`);
