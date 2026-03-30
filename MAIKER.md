@@ -301,18 +301,24 @@ maiker review-cycle --url https://myproduct.com
 
 ## Roadmap to Production
 
-- [x] LangGraph orchestration with durable checkpoints
-- [x] 6 specialized agents with model routing
-- [x] Deterministic + AI validation engine
+- [x] LangGraph orchestration with durable checkpoints (SqliteSaver)
+- [x] 6 specialized agents with unified tool loop (all providers)
+- [x] Deterministic + AI validation engine (11 implemented, 3 planned)
 - [x] Bounded retry with escalation policies
 - [x] OAuth auto-detect (Claude Code)
 - [x] CLI with 15+ commands
 - [x] Error classification and auth abort
-- [ ] **Test suite** (vitest — in progress)
-- [ ] **Self-check command** (in progress)
-- [ ] **Periodic review agent** (in progress)
+- [x] Test suite (vitest — 138 tests)
+- [x] Self-check command (`maiker selfcheck`)
+- [x] Periodic review agent (`maiker review-cycle`)
+- [x] Execution safety guards (path sandbox, command denylist, secret scanning)
+- [x] Worktree isolation for parallel execution (early — rollback on merge conflict)
+- [x] Repair strategy diversity (4-level escalation)
+- [x] Provider health tracking with fallback chains
+- [x] Pause/resume with durable checkpoint restore (SqliteSaver → .maiker/checkpoints.db)
 - [ ] CI/CD pipeline (GitHub Actions)
-- [ ] Pause/resume with full checkpoint restore
 - [ ] Local dashboard UI
 - [ ] Incremental repo inspection (cache between runs)
 - [ ] File-scoped context windows for large repos
+- [ ] Pixel-level screenshot diffing (currently byte-level)
+- [ ] Hardened worktree merge for complex repos

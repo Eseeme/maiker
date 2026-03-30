@@ -741,7 +741,7 @@ INIT → INSPECT → CLASSIFY → PLAN → EXECUTE (parallel subtasks)
 | **VALIDATE_VISUAL** | Runs Playwright E2E, captures screenshots, AI visual review |
 | **REPAIR** | Repair agent gets open issues + per-issue attempt counts + history of prior repairs. Tries different approach on repeat attempts. |
 | **HUMAN_ESCALATION** | Uses LangGraph `interrupt()` to pause graph. Writes escalation packet. Resume with `maiker resume --decision proceed\|replan\|abort` |
-| **POST_APPROVAL_REVIEW** | If `require_human_approval: true`, pauses for human go-ahead (uses `interrupt()`). Then scans for hidden regressions and scope drift. |
+| **POST_APPROVAL_REVIEW** | If `require_human_approval: true`, pauses for human go-ahead (uses `interrupt()`). Then scans for hidden regressions and scope drift. **Advisory only** — failures are logged but do not block promotion. This is a deliberate design choice: the stage surfaces concerns for human review rather than acting as a hard gate. |
 | **PROMOTE** | Writes final summary, cleans up git checkpoint |
 
 ---
@@ -768,21 +768,24 @@ You can override which validators run by editing the `validators:` section in `m
 
 ## Security
 
-mAIker includes a layered execution safety system:
+mAIker includes a layered execution safety system. These are early implementations being actively hardened — not battle-tested production guarantees.
 
-| Layer | What it does | Status |
-|-------|-------------|--------|
+| Layer | What it does | Maturity |
+|-------|-------------|----------|
 | **Path sandboxing** | All file ops validated to stay within project root. Blocks `../../` traversal. | Implemented |
 | **Command allow/deny lists** | Blocks `rm -rf /`, `git push --force`, `sudo`, `curl\|sh`, etc. Three modes: safe, workspace, full. | Implemented |
 | **Sensitive file protection** | Blocks writes to `.env*`, `.pem`, `credentials.json`, SSH keys. | Implemented |
-| **Secret scanning** | Pre-write hook detects API keys, tokens, private keys in file content. | Implemented |
+| **Secret scanning** | Pre-write hook detects API keys, tokens, private keys via regex patterns. | Early — pattern-based, not comprehensive |
 | **No-touch zone enforcement** | Hard blocks writes to protected paths (not just prompt instructions). | Implemented |
 | **Auto-formatting** | Post-write hook auto-formats via prettier/biome if detected. | Implemented |
-| **Scoped subprocess permissions** | Claude Code subprocess uses `--permission-mode dontAsk` with `--allowedTools` instead of `--dangerously-skip-permissions`. | Implemented |
-| **Worktree isolation** | Parallel subtasks run in isolated git worktrees, merged after completion. | Implemented |
-| **Repair strategy diversity** | Escalating strategies per retry: local fix → root cause → replan → alternate model. | Implemented |
-| **Test impact analysis** | Selective reruns based on changed files. | Planned |
-| **Screenshot diffing** | Before/after visual regression detection. | Planned |
+| **Scoped subprocess permissions** | Claude Code subprocess uses `--permission-mode dontAsk` with `--allowedTools`. | Implemented |
+| **Worktree isolation** | Parallel subtasks run in isolated git worktrees, merged after completion. Merge conflicts trigger full-wave rollback. | Early — works for independent subtasks, complex repos may hit edge cases |
+| **Repair strategy diversity** | Escalating strategies per retry: local fix → root cause → replan → alternate model. | Early — strategy selection is rule-based, not adaptive |
+| **Durable checkpointing** | SqliteSaver persists graph state to `.maiker/checkpoints.db` for pause/resume across process restarts. | Implemented |
+| **Selective validator reruns** | After repair, only re-run failed validators + their dependents. | Implemented |
+| **Screenshot diffing** | Before/after byte-level comparison against baseline screenshots. | Early — byte diff, not pixel-level |
+
+> **Note on `sh -c`:** Commands containing shell metacharacters (`|`, `&&`, `;`) are routed through `sh -c` after passing the command allow/deny list. This is a known hotspot — the guards reduce risk significantly but `sh -c` remains inherently powerful. The `safe` security mode mitigates this by restricting to read-only + build/test commands only.
 
 Configure via `maiker.config.yaml`:
 

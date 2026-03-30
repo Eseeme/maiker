@@ -5,7 +5,7 @@
  * - Annotation for typed, reducible state
  * - Conditional edges for routing decisions
  * - Promise.allSettled for parallel subtask fan-out within waves
- * - SqliteSaver for durable checkpointing and cross-process resume
+ * - SqliteSaver for durable checkpointing (.maiker/checkpoints.db) and cross-process resume
  * - interrupt() for human-in-the-loop escalation
  *
  * Stage flow:
@@ -24,7 +24,7 @@ import {
   END,
   START,
 } from '@langchain/langgraph';
-import { MemorySaver } from '@langchain/langgraph';
+import { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
 
 import type {
   WorkflowInput,
@@ -88,6 +88,7 @@ import {
   removeWorktree,
   stageAll,
   commit,
+  getCurrentCommit,
 } from '../../tools/git/index.js';
 import { writeEscalationPacket, saveFinalSummary } from '../../artifacts/index.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -256,7 +257,11 @@ import { runCommand } from '../../tools/shell/index.js';
 
 /**
  * Execute a subtask in an isolated git worktree.
- * Returns the changed files and notes. The worktree is cleaned up after.
+ * Returns the changed files and notes.
+ *
+ * The worktree directory is cleaned up after execution, but the BRANCH is
+ * preserved so mergeWorktreeChanges() can cherry-pick from it later.
+ * Caller must call cleanupWorktreeBranch() after merge is done.
  */
 async function executeInWorktree(
   subtask: Subtask,
@@ -288,7 +293,7 @@ async function executeInWorktree(
       sharedContext,
     }, state.config);
 
-    // Commit changes in the worktree so they can be merged
+    // Commit changes in the worktree so they can be merged back later
     if (result.changedFiles.length > 0) {
       await stageAll(worktreePath);
       await commit(worktreePath, `[maiker] ${subtask.id}: ${subtask.title}`);
@@ -299,30 +304,42 @@ async function executeInWorktree(
       implementationNotes: result.implementationNotes,
     };
   } finally {
-    // Always clean up the worktree
+    // Clean up the worktree directory, but KEEP the branch for merge-back
     try {
       await removeWorktree(state.projectPath, worktreePath);
-      // Clean up the branch
-      await runCommand('git', ['branch', '-D', branchName], { cwd: state.projectPath });
-      console.log(`    [worktree] Cleaned up: ${worktreePath}`);
+      console.log(`    [worktree] Removed worktree dir: ${worktreePath} (branch preserved)`);
     } catch (cleanupErr) {
       console.warn(`    [worktree] Cleanup warning: ${String(cleanupErr)}`);
     }
   }
 }
 
+/** Clean up a worktree branch after merge-back is complete or abandoned. */
+async function cleanupWorktreeBranch(
+  projectPath: string,
+  branchName: string,
+): Promise<void> {
+  try {
+    await runCommand('git', ['branch', '-D', branchName], { cwd: projectPath });
+  } catch { /* branch may already be gone */ }
+}
+
 /**
  * Merge a worktree branch's changes into the main working directory.
- * Uses cherry-pick to apply the commit without creating a merge commit.
+ * Uses cherry-pick --no-commit to stage changes without a merge commit.
+ *
+ * On conflict: aborts the cherry-pick cleanly so the repo isn't left
+ * in a broken state. Returns success/failure so the caller can decide
+ * whether to fall back to sequential re-execution.
  */
 async function mergeWorktreeChanges(
   projectPath: string,
   branchName: string,
-): Promise<void> {
-  // Get the tip commit of the worktree branch
+): Promise<{ success: boolean; error?: string }> {
+  // Resolve the branch tip
   const result = await runCommand('git', ['rev-parse', branchName], { cwd: projectPath });
   if (result.exitCode !== 0) {
-    throw new Error(`Failed to resolve branch ${branchName}: ${result.stderr}`);
+    return { success: false, error: `Branch not found: ${branchName}` };
   }
   const commitRef = result.stdout.trim();
 
@@ -330,9 +347,17 @@ async function mergeWorktreeChanges(
   const cpResult = await runCommand('git', ['cherry-pick', commitRef, '--no-commit'], {
     cwd: projectPath,
   });
+
   if (cpResult.exitCode !== 0) {
-    throw new Error(`Merge conflict when applying ${branchName}: ${cpResult.stderr}`);
+    // Abort the cherry-pick to leave the repo in a clean state
+    await runCommand('git', ['cherry-pick', '--abort'], { cwd: projectPath });
+    return {
+      success: false,
+      error: `Merge conflict applying ${branchName}: ${cpResult.stderr.slice(0, 200)}`,
+    };
   }
+
+  return { success: true };
 }
 
 function mapValidatorToCategory(name: ValidatorName | string): Issue['category'] {
@@ -679,27 +704,64 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
       // applied to the main repo. Sequential execution writes directly.
       if (useWorktrees && group.length > 1 && worktreeSuccesses.length > 0) {
         console.log(`[maiker] Merging ${worktreeSuccesses.length} worktree result(s) into main directory`);
+
+        // Record pre-merge state so we can rollback all merges if any fails
+        const preMergeRef = await getCurrentCommit(state.projectPath).catch(() => '');
+        let mergesFailed = false;
+
         for (const { subtask } of worktreeSuccesses) {
           const branchName = `maiker/${state.runId}/${subtask.id}`;
-          try {
-            await mergeWorktreeChanges(state.projectPath, branchName);
+          const mergeResult = await mergeWorktreeChanges(state.projectPath, branchName);
+
+          if (mergeResult.success) {
             console.log(`[maiker]   ✓ Merged ${subtask.id}`);
-          } catch (mergeErr) {
-            console.warn(`[maiker]   ✗ Merge conflict for ${subtask.id}: ${String(mergeErr)}`);
-            // On merge conflict, mark as failed — repair loop will handle it
+          } else {
+            console.warn(`[maiker]   ✗ ${subtask.id}: ${mergeResult.error}`);
             subtaskStates[subtask.id] = {
               ...subtaskStates[subtask.id],
               status: 'failed',
-              error: `Merge conflict: ${String(mergeErr)}`,
+              error: `Merge conflict: ${mergeResult.error}`,
             };
+            mergesFailed = true;
+
+            // If any merge fails, rollback ALL merges in this wave to avoid
+            // a partially-applied state, then fall back to sequential re-execution
+            if (preMergeRef) {
+              console.warn(`[maiker]   Rolling back all wave merges to pre-merge state`);
+              await runCommand('git', ['reset', '--hard', preMergeRef], { cwd: state.projectPath });
+
+              // Mark all remaining subtasks in this wave for sequential re-execution
+              // The repair loop will pick them up
+              for (const { subtask: s } of worktreeSuccesses) {
+                if (subtaskStates[s.id]?.status !== 'failed') {
+                  subtaskStates[s.id] = {
+                    ...subtaskStates[s.id],
+                    status: 'failed',
+                    error: 'Rolled back due to merge conflict in another subtask — needs sequential re-execution',
+                  };
+                }
+              }
+              break;
+            }
+          }
+
+          // Clean up the branch after successful merge
+          await cleanupWorktreeBranch(state.projectPath, branchName);
+        }
+
+        // Commit the successfully merged results (if no rollback)
+        if (!mergesFailed) {
+          try {
+            await stageAll(state.projectPath);
+            await commit(state.projectPath, `[maiker] Merged wave results for ${state.runId}`);
+          } catch {
+            // Nothing to commit (all merges were no-ops or empty)
           }
         }
-        // Commit the merged results
-        try {
-          await stageAll(state.projectPath);
-          await commit(state.projectPath, `[maiker] Merged wave results for ${state.runId}`);
-        } catch {
-          // May fail if nothing to commit (all merges were no-ops)
+
+        // Clean up any remaining branches (from failed merges or rollbacks)
+        for (const { subtask: s } of worktreeSuccesses) {
+          await cleanupWorktreeBranch(state.projectPath, `maiker/${state.runId}/${s.id}`);
         }
       }
     }
@@ -1262,8 +1324,22 @@ function buildWorkflowGraph() {
 
 // ─── Workflow Runner ──────────────────────────────────────────────────────────
 
-// In-memory checkpointer — used for within-process interrupt/resume cycles
-const checkpointer = new MemorySaver();
+// Durable checkpointer — persists graph state to .maiker/checkpoints.db
+// Enables pause/resume across process restarts via `maiker resume`
+let _checkpointer: SqliteSaver | null = null;
+
+function getCheckpointer(): SqliteSaver {
+  if (!_checkpointer) {
+    const dbPath = join(process.cwd(), '.maiker', 'checkpoints.db');
+    // SqliteSaver creates the file and parent directories as needed
+    _checkpointer = SqliteSaver.fromConnString(dbPath);
+  }
+  return _checkpointer;
+}
+
+// Ensure .maiker directory exists for the checkpoint database
+import { mkdirSync } from 'fs';
+try { mkdirSync(join(process.cwd(), '.maiker'), { recursive: true }); } catch { /* exists */ }
 
 export async function runWorkflow(input: WorkflowInput): Promise<GraphState> {
   const { runId, goal, projectPath, config } = input;
@@ -1280,7 +1356,7 @@ export async function runWorkflow(input: WorkflowInput): Promise<GraphState> {
 
   // Compile the graph with checkpointing
   const graph = buildWorkflowGraph();
-  const app = graph.compile({ checkpointer });
+  const app = graph.compile({ checkpointer: getCheckpointer() });
 
   const initialState: Partial<GraphState> = {
     runId,
@@ -1304,7 +1380,7 @@ export async function runWorkflow(input: WorkflowInput): Promise<GraphState> {
     // When interrupt() fires (e.g., human approval), LangGraph returns
     // with stage still set to the interrupting stage. We detect this,
     // wait for user input, then resume — all within the same process
-    // so the MemorySaver checkpoint is preserved.
+    // so the SqliteSaver checkpoint is preserved across process restarts.
     while (currentState.stage === 'POST_APPROVAL_REVIEW' || currentState.stage === 'HUMAN_ESCALATION') {
       // The graph is paused at an interrupt — prompt user inline
       const readline = await import('readline');
@@ -1366,7 +1442,7 @@ export async function resumeWorkflow(
   config: MaikerConfig,
 ): Promise<GraphState> {
   const graph = buildWorkflowGraph();
-  const app = graph.compile({ checkpointer });
+  const app = graph.compile({ checkpointer: getCheckpointer() });
 
   await eventBus.attachRunLog(runId, config.artifacts.outputDir);
 
