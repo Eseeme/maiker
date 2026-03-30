@@ -197,6 +197,24 @@ async function validateChangedFiles(
     }
   }
 
+  // Lockfile mutation check — if package.json changed, lockfile should too (and vice versa)
+  const hasPackageJson = changedFiles.some(f => f.endsWith('package.json'));
+  const hasLockfile = changedFiles.some(f =>
+    f.endsWith('package-lock.json') || f.endsWith('yarn.lock') || f.endsWith('pnpm-lock.yaml'),
+  );
+  if (hasPackageJson && !hasLockfile) {
+    violations.push('package.json was modified but no lockfile was updated — run install to sync');
+  }
+
+  // Forbidden file class check — binary/large files that agents shouldn't create
+  const forbiddenExts = ['.exe', '.dll', '.so', '.dylib', '.bin', '.dat', '.zip', '.tar', '.gz'];
+  for (const file of changedFiles) {
+    const ext = extname(file).toLowerCase();
+    if (forbiddenExts.includes(ext)) {
+      violations.push(`Binary/archive file created by agent: ${file} — review if intentional`);
+    }
+  }
+
   return {
     passed: violations.length === 0,
     violations,
@@ -237,8 +255,27 @@ export function createHooks(
     },
 
     async preCommand(command: string): Promise<HookResult> {
-      // Additional command-level policy checks can go here
-      // (The guards module handles the base allow/deny lists)
+      // Block commands that try to modify package manager lockfiles directly
+      if (/\bwrite\b.*lock|>.*\.lock\b/i.test(command)) {
+        return { blocked: true, reason: 'Direct lockfile mutation blocked — use package manager commands instead' };
+      }
+
+      // Warn on sh -c usage (command already passed allow/deny, but log for observability)
+      if (/[|&;<>`$()]/.test(command)) {
+        console.warn(`    [hook] Shell metacharacters in command — will use sh -c: ${command.slice(0, 60)}...`);
+      }
+
+      // Block commands that attempt to install global packages
+      if (/\bnpm\s+install\s+(-g|--global)\b/.test(command) ||
+          /\byarn\s+global\b/.test(command)) {
+        return { blocked: true, reason: 'Global package installation blocked — agents should only modify the project' };
+      }
+
+      // Block git config modifications
+      if (/\bgit\s+config\b/.test(command)) {
+        return { blocked: true, reason: 'Git config modification blocked by policy' };
+      }
+
       return { blocked: false };
     },
 

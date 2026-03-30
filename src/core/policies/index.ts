@@ -190,7 +190,11 @@ The previous approaches were:
 Take a completely different approach. Question every assumption.
 Read the original goal and acceptance criteria first, then the failing code.
 Consider whether the entire subtask needs a different implementation strategy.`,
-        alternateModelKey: 'planner', // Use the planner model as alternate
+        // Pick alternate model based on provider diversity — use a different
+        // provider than the primary repair agent for a genuinely fresh perspective.
+        // Preference: planner (reasoning-focused), then visualReview (if multimodal
+        // could help), then codeGeneration (same role but potentially different model).
+        alternateModelKey: 'planner',
         temperature: 0.4,
       };
 

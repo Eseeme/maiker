@@ -800,6 +800,27 @@ policies:
 
 ---
 
+## Current Support Boundaries
+
+mAIker is tested and strongest on repos that match these assumptions:
+
+| Assumption | Why it matters |
+|-----------|---------------|
+| **Git-based** | Worktree isolation, checkpointing, and rollback all depend on git |
+| **JS/TS ecosystem** | Build/test/lint commands assume npm/yarn/pnpm/bun tooling |
+| **Reasonably modular** | Parallel execution works best when subtasks touch independent files |
+| **Standard build workflows** | Validators run `npm run build`, `npm test`, etc. — custom build systems need config |
+| **Not too much generated state** | Conflict detection doesn't track generated files, lockfiles, or migration outputs |
+| **Git working directory is clean** | Checkpointing commits uncommitted changes — dirty state may cause unexpected commits |
+
+**Not yet tested on:**
+- Large monorepos with complex workspace/package boundaries
+- Repos with heavy code generation (protobuf, GraphQL codegen, ORM migrations)
+- Non-JS/TS ecosystems (Python, Go, Rust — provider/tool loop works, but validators don't)
+- CI/CD environments (designed for local-first interactive use)
+
+---
+
 ## Architecture Overview
 
 ```

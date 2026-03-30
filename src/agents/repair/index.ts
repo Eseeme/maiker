@@ -47,11 +47,25 @@ export async function runRepairAgent(
   // Get the escalating strategy for this attempt
   const strategyConfig = getRepairStrategy(currentAttempt);
 
-  // Select model: use alternate model on attempt 4+ if available
+  // Select model: on alternate_model strategy, prefer a different PROVIDER for genuine diversity
   let modelConfig = config.models.repairAgent;
-  if (strategyConfig.alternateModelKey && config.models[strategyConfig.alternateModelKey]) {
-    modelConfig = config.models[strategyConfig.alternateModelKey];
-    console.log(`    [repair] Using alternate model: ${modelConfig.provider}/${modelConfig.model} (strategy: ${strategyConfig.strategy})`);
+  if (strategyConfig.strategy === 'alternate_model') {
+    const primaryProvider = config.models.repairAgent.provider;
+    // Find a model role that uses a different provider
+    const alternateRoles: Array<keyof typeof config.models> = [
+      'planner', 'codeGeneration', 'visualReview', 'postApprovalReview', 'researchIngestion',
+    ];
+    const alternate = alternateRoles.find(role =>
+      config.models[role].provider !== primaryProvider,
+    );
+    if (alternate) {
+      modelConfig = config.models[alternate];
+      console.log(`    [repair] Using alternate provider: ${modelConfig.provider}/${modelConfig.model} (different from primary: ${primaryProvider})`);
+    } else if (strategyConfig.alternateModelKey && config.models[strategyConfig.alternateModelKey]) {
+      // Same provider but different model (fallback if all providers are the same)
+      modelConfig = config.models[strategyConfig.alternateModelKey];
+      console.log(`    [repair] Using alternate model: ${modelConfig.provider}/${modelConfig.model} (same provider — no other providers configured)`);
+    }
   }
 
   // Apply temperature override if strategy calls for it

@@ -76,7 +76,7 @@ import { runResearchAgent } from '../../agents/research/index.js';
 import { runPlannerAgent, buildFallbackPlan } from '../../agents/planner/index.js';
 import { runRepairAgent } from '../../agents/repair/index.js';
 import { runPostApprovalReviewAgent } from '../../agents/review/index.js';
-import { getValidationProfile, shouldEscalate, shouldAutoReplan } from '../policies/index.js';
+import { getValidationProfile, shouldEscalate, shouldAutoReplan, getRepairStrategy } from '../policies/index.js';
 import { runFullValidation } from '../../validators/engine/index.js';
 import { summariseRepo } from '../../tools/filesystem/index.js';
 import {
@@ -1068,6 +1068,9 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
   emitRepairStarted(state.runId, runRetry);
   await setAgent(state.runId, 'repair', `Applying repair (attempt ${runRetry})`);
 
+  // Determine strategy for structured history
+  const strategyConfig = getRepairStrategy(runRetry);
+
   try {
     emitAgentInvoked(state.runId, 'repair', state.config.models.repairAgent.model);
 
@@ -1098,7 +1101,7 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
     return {
       stage: 'VALIDATE_DETERMINISTIC' as WorkflowStage,
       retryCounts: updatedRetryCounts,
-      repairHistory: [`[attempt ${runRetry}] ${repairOutput.patchPlan} → changed: ${repairOutput.changedFiles.join(', ')}`],
+      repairHistory: [`[attempt ${runRetry}] strategy=${strategyConfig.strategy} | plan=${repairOutput.patchPlan} | changed=${repairOutput.changedFiles.join(', ')} | outcome=pending_validation`],
       status: 'running' as RunStatus,
     };
   } catch (err) {
@@ -1111,7 +1114,7 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
       return {
         stage: 'HUMAN_ESCALATION' as WorkflowStage,
         retryCounts: updatedRetryCounts,
-        repairHistory: [`[attempt ${runRetry}] AUTH FAILURE: ${classified.message}`],
+        repairHistory: [`[attempt ${runRetry}] strategy=${strategyConfig.strategy} | AUTH FAILURE: ${classified.message} | outcome=escalated`],
         status: 'running' as RunStatus,
       };
     }
@@ -1119,7 +1122,7 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
     return {
       stage: 'VALIDATE_DETERMINISTIC' as WorkflowStage,
       retryCounts: updatedRetryCounts,
-      repairHistory: [`[attempt ${runRetry}] FAILED [${classified.category}]: ${classified.message}`],
+      repairHistory: [`[attempt ${runRetry}] strategy=${strategyConfig.strategy} | error=${classified.category}: ${classified.message} | outcome=agent_failed`],
       status: 'running' as RunStatus,
     };
   }
