@@ -717,39 +717,81 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
             console.log(`[maiker]   ✓ Merged ${subtask.id}`);
           } else {
             console.warn(`[maiker]   ✗ ${subtask.id}: ${mergeResult.error}`);
-            subtaskStates[subtask.id] = {
-              ...subtaskStates[subtask.id],
-              status: 'failed',
-              error: `Merge conflict: ${mergeResult.error}`,
-            };
             mergesFailed = true;
 
-            // If any merge fails, rollback ALL merges in this wave to avoid
-            // a partially-applied state, then fall back to sequential re-execution
+            // Rollback ALL merges in this wave to avoid partial state
             if (preMergeRef) {
               console.warn(`[maiker]   Rolling back all wave merges to pre-merge state`);
               await runCommand('git', ['reset', '--hard', preMergeRef], { cwd: state.projectPath });
-
-              // Mark all remaining subtasks in this wave for sequential re-execution
-              // The repair loop will pick them up
-              for (const { subtask: s } of worktreeSuccesses) {
-                if (subtaskStates[s.id]?.status !== 'failed') {
-                  subtaskStates[s.id] = {
-                    ...subtaskStates[s.id],
-                    status: 'failed',
-                    error: 'Rolled back due to merge conflict in another subtask — needs sequential re-execution',
-                  };
-                }
-              }
-              break;
             }
+
+            // Clean up all worktree branches before re-execution
+            for (const { subtask: s } of worktreeSuccesses) {
+              await cleanupWorktreeBranch(state.projectPath, `maiker/${state.runId}/${s.id}`);
+            }
+
+            // IMMEDIATE SEQUENTIAL RE-EXECUTION in the main directory
+            // This is a deterministic fallback — not routed to the repair loop,
+            // because the issue is merge coordination, not implementation quality.
+            console.log(`[maiker]   Re-executing wave sequentially in main directory`);
+            const waveSubtasks = worktreeSuccesses.map(ws => ws.subtask);
+            for (const rerunSubtask of waveSubtasks) {
+              emitAgentInvoked(state.runId, 'coder', state.config.models.codeGeneration.model);
+              await setAgent(state.runId, 'coder', `[${rerunSubtask.id}] sequential re-exec — ${rerunSubtask.title}`);
+              try {
+                const { runCodeAgent } = await import('../../agents/coder/index.js');
+                const rerunResult = await runCodeAgent({
+                  runId: state.runId,
+                  goal: state.goal,
+                  projectPath: state.projectPath,
+                  subtask: rerunSubtask,
+                  acceptanceCriteria: rerunSubtask.acceptanceCriteria,
+                  fileTargets: rerunSubtask.fileTargets,
+                  noTouchConstraints: plan.classification.noTouchZones,
+                  repoContext: cachedRepoContext,
+                  context: state.contextUpdates.map(c => c.message).join('\n'),
+                  sharedContext,
+                }, state.config);
+
+                subtaskStates[rerunSubtask.id] = {
+                  subtaskId: rerunSubtask.id,
+                  status: 'completed',
+                  startedAt: new Date().toISOString(),
+                  completedAt: new Date().toISOString(),
+                  changedFiles: rerunResult.changedFiles,
+                  implementationNotes: rerunResult.implementationNotes,
+                };
+                sharedContext.changedFiles.push(...rerunResult.changedFiles);
+                sharedContext.completedNotes.push({
+                  subtaskId: rerunSubtask.id,
+                  title: rerunSubtask.title,
+                  notes: rerunResult.implementationNotes,
+                });
+                emitAgentCompleted(state.runId, 'coder');
+                console.log(`[maiker]   ✓ ${rerunSubtask.id} (sequential): ${rerunResult.implementationNotes}`);
+              } catch (rerunErr) {
+                const classified = classifyError(rerunErr);
+                subtaskStates[rerunSubtask.id] = {
+                  subtaskId: rerunSubtask.id,
+                  status: 'failed',
+                  startedAt: new Date().toISOString(),
+                  changedFiles: [],
+                  implementationNotes: '',
+                  error: `[${classified.category}] ${classified.message}`,
+                };
+                emitAgentCompleted(state.runId, 'coder');
+                console.warn(`[maiker]   ✗ ${rerunSubtask.id} (sequential): ${classified.message}`);
+              }
+            }
+
+            break; // Exit the merge loop — wave has been re-executed sequentially
           }
 
           // Clean up the branch after successful merge
           await cleanupWorktreeBranch(state.projectPath, branchName);
         }
 
-        // Commit the successfully merged results (if no rollback)
+        // Commit the successfully merged results (if no rollback happened)
         if (!mergesFailed) {
           try {
             await stageAll(state.projectPath);
@@ -757,11 +799,10 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
           } catch {
             // Nothing to commit (all merges were no-ops or empty)
           }
-        }
-
-        // Clean up any remaining branches (from failed merges or rollbacks)
-        for (const { subtask: s } of worktreeSuccesses) {
-          await cleanupWorktreeBranch(state.projectPath, `maiker/${state.runId}/${s.id}`);
+          // Clean up remaining branches
+          for (const { subtask: s } of worktreeSuccesses) {
+            await cleanupWorktreeBranch(state.projectPath, `maiker/${state.runId}/${s.id}`);
+          }
         }
       }
     }
@@ -1324,22 +1365,24 @@ function buildWorkflowGraph() {
 
 // ─── Workflow Runner ──────────────────────────────────────────────────────────
 
-// Durable checkpointer — persists graph state to .maiker/checkpoints.db
+// Durable checkpointer — persists graph state to <projectRoot>/.maiker/checkpoints.db
 // Enables pause/resume across process restarts via `maiker resume`
-let _checkpointer: SqliteSaver | null = null;
-
-function getCheckpointer(): SqliteSaver {
-  if (!_checkpointer) {
-    const dbPath = join(process.cwd(), '.maiker', 'checkpoints.db');
-    // SqliteSaver creates the file and parent directories as needed
-    _checkpointer = SqliteSaver.fromConnString(dbPath);
-  }
-  return _checkpointer;
-}
-
-// Ensure .maiker directory exists for the checkpoint database
+// Keyed by project path to avoid cross-project contamination.
 import { mkdirSync } from 'fs';
-try { mkdirSync(join(process.cwd(), '.maiker'), { recursive: true }); } catch { /* exists */ }
+
+const _checkpointers = new Map<string, SqliteSaver>();
+
+function getCheckpointer(projectPath: string): SqliteSaver {
+  // Resolve to absolute path for consistent map key
+  const resolvedPath = require('path').resolve(projectPath);
+  if (!_checkpointers.has(resolvedPath)) {
+    const maikerDir = join(resolvedPath, '.maiker');
+    mkdirSync(maikerDir, { recursive: true });
+    const dbPath = join(maikerDir, 'checkpoints.db');
+    _checkpointers.set(resolvedPath, SqliteSaver.fromConnString(dbPath));
+  }
+  return _checkpointers.get(resolvedPath)!;
+}
 
 export async function runWorkflow(input: WorkflowInput): Promise<GraphState> {
   const { runId, goal, projectPath, config } = input;
@@ -1354,9 +1397,9 @@ export async function runWorkflow(input: WorkflowInput): Promise<GraphState> {
   emitRunStarted(runId);
   await setStatus(runId, 'running');
 
-  // Compile the graph with checkpointing
+  // Compile the graph with durable checkpointing (project-rooted DB)
   const graph = buildWorkflowGraph();
-  const app = graph.compile({ checkpointer: getCheckpointer() });
+  const app = graph.compile({ checkpointer: getCheckpointer(projectPath) });
 
   const initialState: Partial<GraphState> = {
     runId,
@@ -1440,9 +1483,11 @@ export async function resumeWorkflow(
   runId: string,
   decision: 'proceed' | 'replan' | 'abort',
   config: MaikerConfig,
+  projectPath?: string,
 ): Promise<GraphState> {
   const graph = buildWorkflowGraph();
-  const app = graph.compile({ checkpointer: getCheckpointer() });
+  const resolvedProject = projectPath ?? config.project.root ?? process.cwd();
+  const app = graph.compile({ checkpointer: getCheckpointer(resolvedProject) });
 
   await eventBus.attachRunLog(runId, config.artifacts.outputDir);
 

@@ -164,6 +164,14 @@ export async function executeTool(
           return { output: `Blocked: ${guard.reason}`, isError: true };
         }
 
+        // Policy hook: preCommand (additional command-level policy checks)
+        if (hooks) {
+          const hookResult = await hooks.preCommand(toolInput.command);
+          if (hookResult.blocked) {
+            return { output: `Blocked by policy: ${hookResult.reason}`, isError: true };
+          }
+        }
+
         // Parse command safely — uses execFile without shell: true for simple commands
         const { cmd, args } = parseCommand(toolInput.command);
 
