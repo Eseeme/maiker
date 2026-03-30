@@ -29,7 +29,7 @@
           ▼                  ▼                  ▼
     ┌──────────┐     ┌──────────────┐    ┌───────────┐
     │  Agents  │     │  Validators  │    │   Tools   │
-    │ (6 roles)│     │ (14 checks)  │    │ (7 groups)│
+    │ (6 roles)│     │ (11 + 3 planned) │ │ (7 groups)│
     └──────────┘     └──────────────┘    └───────────┘
           │                  │                  │
           ▼                  ▼                  ▼
@@ -52,7 +52,9 @@
 | 5 | **Visual Review** | `src/agents/visual/index.ts` | GPT-4o / Claude | Analyze screenshots across viewport matrix, identify layout/UX violations |
 | 6 | **Post-Approval Review** | `src/agents/review/index.ts` | Claude Haiku 4.5 / GPT-4o-mini | Scan final diff for regressions, scope drift, suspicious churn |
 
-**Shared infrastructure:** `src/agents/shared/tool-loop.ts` — deterministic tool execution with OAuth-aware client creation.
+**Shared infrastructure:** `src/agents/shared/tool-loop.ts` — unified provider-agnostic tool execution loop. All providers (Claude, OpenAI, Gemini, pi-mono) go through the same tool protocol with security guards and policy hooks.
+
+**Execution safety:** `src/core/guards/index.ts` — path sandboxing, command allow/deny lists, secret scanning, no-touch zone enforcement.
 
 ---
 
@@ -96,15 +98,20 @@
 | `lockfile_sanity` | Dependency versions consistent |
 | `regression_tests` | Regression test suite passes |
 
-### AI-Based
+### AI-Based (implemented)
 
-| Validator | Purpose |
-|-----------|---------|
-| `screenshot_capture` | Playwright captures at configured viewports |
-| `visual_review` | LLM analyzes screenshots for layout/UX issues |
-| `ux_rules` | Application of UX constraints from task brief |
-| `accessibility` | Accessibility rule checking |
-| `mobile_layout_rules` | Mobile-specific layout validation |
+| Validator | Purpose | Status |
+|-----------|---------|--------|
+| `screenshot_capture` | Playwright captures at configured viewports | Implemented |
+| `visual_review` | LLM analyzes screenshots for layout/UX issues | Implemented |
+
+### AI-Based (planned)
+
+| Validator | Purpose | Status |
+|-----------|---------|--------|
+| `ux_rules` | Application of UX constraints from task brief | Planned — currently triggers visual_review |
+| `accessibility` | Accessibility rule checking | Planned |
+| `mobile_layout_rules` | Mobile-specific layout validation | Planned |
 
 ### Validation Profiles (auto-selected by task type)
 

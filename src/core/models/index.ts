@@ -20,6 +20,14 @@ export interface ModelEntry {
   contextWindow: number;
   /** Supports vision/multimodal */
   multimodal: boolean;
+  /** Approximate cost per 1M input tokens (USD) */
+  inputCostPer1M?: number;
+  /** Approximate cost per 1M output tokens (USD) */
+  outputCostPer1M?: number;
+  /** Relative latency tier: 1=fast, 2=medium, 3=slow */
+  latencyTier?: number;
+  /** Whether this model supports native function calling / tool use */
+  supportsToolUse?: boolean;
 }
 
 export type AgentRole =
@@ -46,19 +54,19 @@ export function getRoleLabel(role: AgentRole): string {
 /** All known models grouped by provider */
 const MODEL_REGISTRY: ModelEntry[] = [
   // ── Claude ──
-  { provider: 'claude', model: 'claude-opus-4-6',    strengths: ['reasoning', 'code', 'analysis', 'planning'], costTier: 3, contextWindow: 200_000, multimodal: true },
-  { provider: 'claude', model: 'claude-sonnet-4-6',  strengths: ['code', 'analysis', 'repair', 'fast'],        costTier: 2, contextWindow: 200_000, multimodal: true },
-  { provider: 'claude', model: 'claude-haiku-4-5',   strengths: ['fast', 'cheap', 'review'],                   costTier: 1, contextWindow: 200_000, multimodal: true },
+  { provider: 'claude', model: 'claude-opus-4-6',    strengths: ['reasoning', 'code', 'analysis', 'planning'], costTier: 3, contextWindow: 200_000, multimodal: true, inputCostPer1M: 15, outputCostPer1M: 75, latencyTier: 3, supportsToolUse: true },
+  { provider: 'claude', model: 'claude-sonnet-4-6',  strengths: ['code', 'analysis', 'repair', 'fast'],        costTier: 2, contextWindow: 200_000, multimodal: true, inputCostPer1M: 3, outputCostPer1M: 15, latencyTier: 2, supportsToolUse: true },
+  { provider: 'claude', model: 'claude-haiku-4-5',   strengths: ['fast', 'cheap', 'review'],                   costTier: 1, contextWindow: 200_000, multimodal: true, inputCostPer1M: 0.8, outputCostPer1M: 4, latencyTier: 1, supportsToolUse: true },
 
   // ── OpenAI ──
-  { provider: 'openai', model: 'o3',                 strengths: ['reasoning', 'planning', 'analysis'],         costTier: 3, contextWindow: 200_000, multimodal: false },
-  { provider: 'openai', model: 'gpt-4o',             strengths: ['code', 'vision', 'fast'],                    costTier: 2, contextWindow: 128_000, multimodal: true },
-  { provider: 'openai', model: 'gpt-4o-mini',        strengths: ['fast', 'cheap', 'review'],                   costTier: 1, contextWindow: 128_000, multimodal: true },
-  { provider: 'openai', model: 'codex-mini',         strengths: ['code', 'repair', 'fast'],                    costTier: 1, contextWindow: 200_000, multimodal: false },
+  { provider: 'openai', model: 'o3',                 strengths: ['reasoning', 'planning', 'analysis'],         costTier: 3, contextWindow: 200_000, multimodal: false, inputCostPer1M: 10, outputCostPer1M: 40, latencyTier: 3, supportsToolUse: true },
+  { provider: 'openai', model: 'gpt-4o',             strengths: ['code', 'vision', 'fast'],                    costTier: 2, contextWindow: 128_000, multimodal: true, inputCostPer1M: 2.5, outputCostPer1M: 10, latencyTier: 2, supportsToolUse: true },
+  { provider: 'openai', model: 'gpt-4o-mini',        strengths: ['fast', 'cheap', 'review'],                   costTier: 1, contextWindow: 128_000, multimodal: true, inputCostPer1M: 0.15, outputCostPer1M: 0.6, latencyTier: 1, supportsToolUse: true },
+  { provider: 'openai', model: 'codex-mini',         strengths: ['code', 'repair', 'fast'],                    costTier: 1, contextWindow: 200_000, multimodal: false, inputCostPer1M: 1.5, outputCostPer1M: 6, latencyTier: 1, supportsToolUse: true },
 
   // ── Gemini ──
-  { provider: 'gemini', model: 'gemini-2.5-pro',     strengths: ['research', 'large-context', 'reasoning'],    costTier: 2, contextWindow: 1_000_000, multimodal: true },
-  { provider: 'gemini', model: 'gemini-2.5-flash',   strengths: ['fast', 'cheap', 'research'],                 costTier: 1, contextWindow: 1_000_000, multimodal: true },
+  { provider: 'gemini', model: 'gemini-2.5-pro',     strengths: ['research', 'large-context', 'reasoning'],    costTier: 2, contextWindow: 1_000_000, multimodal: true, inputCostPer1M: 1.25, outputCostPer1M: 10, latencyTier: 2, supportsToolUse: true },
+  { provider: 'gemini', model: 'gemini-2.5-flash',   strengths: ['fast', 'cheap', 'research'],                 costTier: 1, contextWindow: 1_000_000, multimodal: true, inputCostPer1M: 0.15, outputCostPer1M: 0.6, latencyTier: 1, supportsToolUse: true },
 ];
 
 /** What each role needs from a model */
@@ -225,6 +233,181 @@ export async function validateProviderKey(provider: string): Promise<{ valid: bo
   } catch (err) {
     return { valid: false, error: String(err) };
   }
+}
+
+// ─── Provider Health Tracking ────────────────────────────────────────────────
+
+interface ProviderHealthState {
+  lastSuccess: number;   // timestamp
+  lastFailure: number;   // timestamp
+  consecutiveFailures: number;
+  totalCalls: number;
+  totalFailures: number;
+  /** Average latency in ms (rolling window) */
+  avgLatencyMs: number;
+}
+
+const providerHealth = new Map<string, ProviderHealthState>();
+
+function getHealthState(provider: string): ProviderHealthState {
+  if (!providerHealth.has(provider)) {
+    providerHealth.set(provider, {
+      lastSuccess: 0,
+      lastFailure: 0,
+      consecutiveFailures: 0,
+      totalCalls: 0,
+      totalFailures: 0,
+      avgLatencyMs: 0,
+    });
+  }
+  return providerHealth.get(provider)!;
+}
+
+/** Record a successful API call for health tracking */
+export function recordSuccess(provider: string, latencyMs: number): void {
+  const state = getHealthState(provider);
+  state.lastSuccess = Date.now();
+  state.consecutiveFailures = 0;
+  state.totalCalls++;
+  // Rolling average
+  state.avgLatencyMs = state.avgLatencyMs === 0
+    ? latencyMs
+    : state.avgLatencyMs * 0.8 + latencyMs * 0.2;
+}
+
+/** Record a failed API call for health tracking */
+export function recordFailure(provider: string): void {
+  const state = getHealthState(provider);
+  state.lastFailure = Date.now();
+  state.consecutiveFailures++;
+  state.totalCalls++;
+  state.totalFailures++;
+}
+
+/** Check if a provider is considered healthy */
+export function isProviderHealthy(provider: string): boolean {
+  const state = getHealthState(provider);
+  // Unhealthy if 3+ consecutive failures in the last 5 minutes
+  if (state.consecutiveFailures >= 3) {
+    const fiveMinAgo = Date.now() - 5 * 60 * 1000;
+    if (state.lastFailure > fiveMinAgo) return false;
+  }
+  return true;
+}
+
+/** Get health summary for all tracked providers */
+export function getProviderHealthSummary(): Record<string, {
+  healthy: boolean;
+  consecutiveFailures: number;
+  avgLatencyMs: number;
+  successRate: number;
+}> {
+  const summary: Record<string, any> = {};
+  for (const [provider, state] of providerHealth) {
+    summary[provider] = {
+      healthy: isProviderHealthy(provider),
+      consecutiveFailures: state.consecutiveFailures,
+      avgLatencyMs: Math.round(state.avgLatencyMs),
+      successRate: state.totalCalls > 0
+        ? Math.round(((state.totalCalls - state.totalFailures) / state.totalCalls) * 100)
+        : 100,
+    };
+  }
+  return summary;
+}
+
+// ─── Fallback Chains ─────────────────────────────────────────────────────────
+
+/**
+ * Build a fallback chain for a given role.
+ * Returns an ordered list of model configs: primary, then alternatives
+ * ranked by score, excluding unhealthy providers.
+ */
+export function buildFallbackChain(
+  role: AgentRole,
+  primaryConfig: ModelConfig,
+  availableProviders: string[],
+): ModelConfig[] {
+  const chain: ModelConfig[] = [primaryConfig];
+
+  // Get all available models scored for this role
+  const available = MODEL_REGISTRY.filter(m =>
+    availableProviders.includes(m.provider) &&
+    !(m.provider === primaryConfig.provider && m.model === primaryConfig.model),
+  );
+
+  const scored = available
+    .filter(m => isProviderHealthy(m.provider))
+    .map(m => ({ model: m, score: scoreModelForRole(m, role) }))
+    .sort((a, b) => b.score - a.score);
+
+  for (const { model } of scored) {
+    chain.push({ provider: model.provider, model: model.model });
+  }
+
+  return chain;
+}
+
+/**
+ * Get the best available model for a role, considering health.
+ * Falls through the chain until a healthy provider is found.
+ */
+export function getHealthyModel(
+  role: AgentRole,
+  primaryConfig: ModelConfig,
+  availableProviders: string[],
+): ModelConfig {
+  if (isProviderHealthy(primaryConfig.provider)) {
+    return primaryConfig;
+  }
+
+  const chain = buildFallbackChain(role, primaryConfig, availableProviders);
+  for (const config of chain) {
+    if (isProviderHealthy(config.provider)) {
+      return config;
+    }
+  }
+
+  // All unhealthy — return primary anyway (it may recover)
+  return primaryConfig;
+}
+
+// ─── Cost Estimation ─────────────────────────────────────────────────────────
+
+export interface CostEstimate {
+  provider: string;
+  model: string;
+  estimatedInputTokens: number;
+  estimatedOutputTokens: number;
+  estimatedCostUSD: number;
+}
+
+/**
+ * Estimate the cost for a model call given token counts.
+ */
+export function estimateCost(
+  config: ModelConfig,
+  inputTokens: number,
+  outputTokens: number,
+): CostEstimate {
+  const entry = MODEL_REGISTRY.find(m => m.provider === config.provider && m.model === config.model);
+  const inputCost = (entry?.inputCostPer1M ?? 3) * (inputTokens / 1_000_000);
+  const outputCost = (entry?.outputCostPer1M ?? 15) * (outputTokens / 1_000_000);
+
+  return {
+    provider: config.provider,
+    model: config.model,
+    estimatedInputTokens: inputTokens,
+    estimatedOutputTokens: outputTokens,
+    estimatedCostUSD: Math.round((inputCost + outputCost) * 10000) / 10000,
+  };
+}
+
+/**
+ * Look up a model entry from the registry.
+ */
+export function getModelEntry(config: ModelConfig): ModelEntry | undefined {
+  return MODEL_REGISTRY.find(m => m.provider === config.provider && m.model === config.model);
 }
 
 /** Validate all providers used in current config */

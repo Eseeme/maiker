@@ -2,8 +2,7 @@
 # mAIker — One-command installer
 # Usage: sudo ./scripts/bootstrap.sh
 #
-# Installs dependencies, builds, links globally, detects auth.
-# Must run with sudo so npm link works without prompts.
+# After this, `maiker` works globally — no more sudo needed.
 
 set -euo pipefail
 
@@ -50,35 +49,48 @@ fi
 echo -e "  ${GREEN}✓${RESET} Node.js ${NODE_VERSION}"
 echo -e "  ${GREEN}✓${RESET} npm $(npm --version)"
 
-# ── Fix existing dist permissions before build ──────────────────────────────
-if [ -d "$PROJECT_DIR/dist" ]; then
-  chown -R "$REAL_USER" "$PROJECT_DIR/dist" 2>/dev/null || true
-fi
-if [ -d "$PROJECT_DIR/node_modules" ]; then
-  chown -R "$REAL_USER" "$PROJECT_DIR/node_modules" 2>/dev/null || true
-fi
-
-# ── Install ─────────────────────────────────────────────────────────────────
+# ── Clean old artifacts ────────────────────────────────────────────────────
 cd "$PROJECT_DIR"
 
+# Fix any root-owned dirs from previous installs
+for dir in dist out node_modules; do
+  if [ -d "$PROJECT_DIR/$dir" ]; then
+    chown -R "$REAL_USER" "$PROJECT_DIR/$dir" 2>/dev/null || true
+  fi
+done
+
+# Remove old dist/ if it exists (we use out/ now)
+if [ -d "$PROJECT_DIR/dist" ]; then
+  echo -e "  ${GRAY}Cleaning old dist/ directory...${RESET}"
+  rm -rf "$PROJECT_DIR/dist" 2>/dev/null || true
+fi
+
+# ── Install dependencies ───────────────────────────────────────────────────
 echo ""
 echo -e "  ${BOLD}Step 1/4${RESET} — Installing dependencies..."
-sudo -u "$REAL_USER" npm install --loglevel=warn
+sudo -u "$REAL_USER" npm install --legacy-peer-deps --loglevel=warn 2>&1 | tail -3
 
+# ── Build TypeScript ───────────────────────────────────────────────────────
 echo ""
 echo -e "  ${BOLD}Step 2/4${RESET} — Building TypeScript..."
-sudo -u "$REAL_USER" npm run build
+sudo -u "$REAL_USER" npx tsc 2>&1 | tail -5
+echo -e "  ${GREEN}✓${RESET} Built to out/"
 
+# ── Link globally ──────────────────────────────────────────────────────────
 echo ""
 echo -e "  ${BOLD}Step 3/4${RESET} — Linking maiker CLI globally..."
-# --ignore-scripts prevents npm from re-running "prepare" (which would rebuild
-# dist/ as root, causing the permission issue that brought you here).
-npm link --ignore-scripts
-chmod +x "$PROJECT_DIR/dist/bin/maiker.js"
 
-# Fix ownership: npm link runs as root, ensure dist/ stays user-owned
-chown -R "$REAL_USER" "$PROJECT_DIR/dist" 2>/dev/null || true
-# Ensure the global symlink and all linked files are accessible
+# --ignore-scripts prevents npm from re-triggering a build as root
+npm link --ignore-scripts 2>&1 | tail -2
+
+# Make the entry point executable
+chmod +x "$PROJECT_DIR/out/bin/maiker.js"
+
+# Fix ownership so the user never needs sudo again
+chown -R "$REAL_USER" "$PROJECT_DIR/out" 2>/dev/null || true
+chown -R "$REAL_USER" "$PROJECT_DIR/node_modules" 2>/dev/null || true
+
+# Ensure global symlink is accessible
 GLOBAL_BIN=$(npm bin -g 2>/dev/null || echo "/usr/local/bin")
 if [ -f "$GLOBAL_BIN/maiker" ] || [ -L "$GLOBAL_BIN/maiker" ]; then
   chmod +x "$GLOBAL_BIN/maiker"
@@ -88,25 +100,25 @@ if [ -d "$GLOBAL_MODULES/maiker-cli" ]; then
   chmod -R a+rX "$GLOBAL_MODULES/maiker-cli"
 fi
 
-# ── Verify CLI ──────────────────────────────────────────────────────────────
+# ── Verify CLI ─────────────────────────────────────────────────────────────
 echo ""
 if command -v maiker &> /dev/null; then
-  echo -e "  ${GREEN}${BOLD}✓ maiker installed globally${RESET}"
+  MAIKER_VERSION=$(maiker --version 2>/dev/null || echo "unknown")
+  echo -e "  ${GREEN}${BOLD}✓ maiker ${MAIKER_VERSION} installed globally${RESET}"
   echo -e "    ${GRAY}$(which maiker)${RESET}"
 else
-  echo -e "  ${YELLOW}⚠${RESET} maiker not found in PATH — restart your terminal"
+  echo -e "  ${YELLOW}⚠${RESET} maiker not found in PATH — restart your terminal or run:"
+  echo -e "    ${CYAN}export PATH=\"${GLOBAL_BIN}:\$PATH\"${RESET}"
 fi
 
-# ── Auth detection ──────────────────────────────────────────────────────────
+# ── Auth detection ─────────────────────────────────────────────────────────
 echo ""
 echo -e "  ${BOLD}Step 4/4${RESET} — Detecting authentication..."
 
 AUTH_FOUND=false
 
-# Claude Code OAuth (auto-detected at runtime — no .env needed)
-# macOS: stored in Keychain; Linux: stored in ~/.claude/.credentials.json
+# Claude Code OAuth
 if [[ "$(uname)" == "Darwin" ]]; then
-  # macOS — try Keychain
   KEYCHAIN_DATA=$(sudo -u "$REAL_USER" security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || echo "")
   if [[ -n "$KEYCHAIN_DATA" ]]; then
     HAS_OAUTH=$(echo "$KEYCHAIN_DATA" | python3 -c "
@@ -119,13 +131,13 @@ except: print('no')
 " 2>/dev/null || echo "no")
     if [[ "$HAS_OAUTH" == "yes" ]]; then
       echo -e "  ${GREEN}✓${RESET} Claude Code OAuth detected (macOS Keychain)"
+      echo -e "    ${GRAY}Will route through Claude Code subprocess — no API key needed${RESET}"
       AUTH_FOUND=true
     fi
   fi
 fi
 
 if [[ "$AUTH_FOUND" == "false" ]]; then
-  # Linux / fallback — try credentials file
   CLAUDE_CREDS_HOME=$(eval echo "~$REAL_USER")
   CLAUDE_CREDS="$CLAUDE_CREDS_HOME/.claude/.credentials.json"
   if [ -f "$CLAUDE_CREDS" ]; then
@@ -139,6 +151,7 @@ except: print('no')
 " 2>/dev/null || echo "no")
     if [[ "$HAS_OAUTH" == "yes" ]]; then
       echo -e "  ${GREEN}✓${RESET} Claude Code OAuth detected (credentials file)"
+      echo -e "    ${GRAY}Will route through Claude Code subprocess — no API key needed${RESET}"
       AUTH_FOUND=true
     fi
   fi
@@ -160,16 +173,23 @@ if [[ "$AUTH_FOUND" == "false" ]]; then
   echo ""
   echo -e "  ${YELLOW}⚠ No API keys detected.${RESET}"
   echo ""
-  echo -e "    ${GRAY}Option A:${RESET} ${CYAN}claude auth login${RESET}  ${GRAY}(easiest — mAIker auto-detects the token)${RESET}"
-  echo -e "    ${GRAY}Option B:${RESET} Add keys to .env   ${GRAY}(ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY)${RESET}"
+  echo -e "    ${GRAY}Option A:${RESET} ${CYAN}claude auth login${RESET}  ${GRAY}(easiest — auto-detected at runtime)${RESET}"
+  echo -e "    ${GRAY}Option B:${RESET} Add keys to .env   ${GRAY}(ANTHROPIC_API_KEY, GOOGLE_API_KEY)${RESET}"
 fi
 
-# ── Done ────────────────────────────────────────────────────────────────────
+# ── Done ───────────────────────────────────────────────────────────────────
 echo ""
-echo -e "  ${GREEN}${BOLD}Installation complete.${RESET}"
+echo -e "  ${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+echo -e "  ${GREEN}${BOLD}  Installation complete. No more sudo needed.${RESET}"
+echo -e "  ${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo ""
-echo -e "  ${GRAY}Quick start:${RESET}"
+echo -e "  ${GRAY}Get started:${RESET}"
 echo -e "    ${CYAN}cd /path/to/your-project${RESET}"
-echo -e "    ${CYAN}maiker init${RESET}                          ${GRAY}# picks best models per your API keys${RESET}"
+echo -e "    ${CYAN}maiker init${RESET}                          ${GRAY}# detect stack, configure models${RESET}"
 echo -e "    ${CYAN}maiker run . --goal \"your goal\"${RESET}       ${GRAY}# run the full workflow${RESET}"
+echo ""
+echo -e "  ${GRAY}Other commands:${RESET}"
+echo -e "    ${CYAN}maiker auth${RESET}                          ${GRAY}# check API keys & OAuth${RESET}"
+echo -e "    ${CYAN}maiker selfcheck${RESET}                     ${GRAY}# validate maiker health${RESET}"
+echo -e "    ${CYAN}maiker --help${RESET}                        ${GRAY}# see all commands${RESET}"
 echo ""

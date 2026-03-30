@@ -57,6 +57,27 @@ policies:
   max_visual_retries: 2
   stop_on_build_failure: false
 
+  # Execution safety guards — controls what agents can do on disk
+  security:
+    # safe: read-only + build/test only (safest)
+    # workspace: normal development ops within project (default)
+    # full: everything not explicitly blocked
+    mode: workspace
+
+    # Files agents cannot write to (relative to project root)
+    protected_files: []
+    #  - package.json       # lock down dependency changes
+    #  - tsconfig.json      # lock down compiler config
+    #  - .github/           # lock down CI/CD
+
+    # Extra shell commands to allow (beyond mode defaults)
+    allowed_commands: []
+    #  - terraform plan
+
+    # Extra shell commands to block (on top of built-in denylist)
+    blocked_commands: []
+    #  - docker push
+
 artifacts:
   output_dir: .maiker/runs
   save_screenshots: true

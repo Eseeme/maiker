@@ -56,6 +56,12 @@ const DEFAULTS: MaikerConfig = {
     maxAutoRepairsPerRun: 6,
     maxVisualRetries: 2,
     stopOnBuildFailure: false,
+    security: {
+      mode: 'workspace',
+      protectedFiles: [],
+      allowedCommands: [],
+      blockedCommands: [],
+    },
   },
   artifacts: {
     outputDir: '.maiker/runs',

@@ -121,8 +121,29 @@ function generateScreenshotScript(
       config.routes.map((route) => {
         const sanitizedRoute = route.replace(/\//g, '_').replace(/^_/, '') || 'root';
         const filename = `${sanitizedRoute}-${width}x${height}.png`;
+        const errorsFile = `${sanitizedRoute}-${width}x${height}.errors.json`;
         return `
   test('screenshot ${route} at ${width}x${height}', async ({ page }) => {
+    const consoleErrors: string[] = [];
+    const networkErrors: string[] = [];
+
+    // Capture console errors
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') {
+        consoleErrors.push(msg.text());
+      }
+    });
+
+    // Capture uncaught page errors
+    page.on('pageerror', (err) => {
+      consoleErrors.push(err.message);
+    });
+
+    // Capture failed network requests
+    page.on('requestfailed', (req) => {
+      networkErrors.push(\`\${req.method()} \${req.url()} — \${req.failure()?.errorText ?? 'unknown'}\`);
+    });
+
     await page.setViewportSize({ width: ${width}, height: ${height} });
     await page.goto('${config.baseUrl}${route}');
     await page.waitForLoadState('networkidle');
@@ -130,6 +151,15 @@ function generateScreenshotScript(
       path: ${JSON.stringify(join(outputDir, filename))},
       fullPage: true,
     });
+
+    // Save errors alongside screenshot
+    if (consoleErrors.length > 0 || networkErrors.length > 0) {
+      const fs = require('fs');
+      fs.writeFileSync(
+        ${JSON.stringify(join(outputDir, errorsFile))},
+        JSON.stringify({ consoleErrors, networkErrors }, null, 2),
+      );
+    }
   });`;
       }),
     )
@@ -140,6 +170,92 @@ function generateScreenshotScript(
 test.describe('mAIker Screenshot Capture', () => {${viewportTests}
 });
 `;
+}
+
+// ─── Screenshot Diffing ──────────────────────────────────────────────────────
+
+export interface ScreenshotDiffResult {
+  file: string;
+  hasBaseline: boolean;
+  changed: boolean;
+  /** Percentage of pixels that differ (0-100). null if no baseline. */
+  diffPercent: number | null;
+  /** Path to the diff image (if generated) */
+  diffPath?: string;
+}
+
+/**
+ * Compare current screenshots against a baseline directory.
+ * Uses pixel-level comparison via Node.js Buffer comparison.
+ * For more sophisticated diffing, could integrate pixelmatch or similar.
+ */
+export async function diffScreenshots(
+  currentDir: string,
+  baselineDir: string,
+  diffOutputDir?: string,
+): Promise<ScreenshotDiffResult[]> {
+  const results: ScreenshotDiffResult[] = [];
+
+  if (!await fs.pathExists(currentDir)) return results;
+
+  const currentFiles = (await fs.readdir(currentDir)).filter(f => f.endsWith('.png'));
+
+  for (const file of currentFiles) {
+    const currentPath = join(currentDir, file);
+    const baselinePath = join(baselineDir, file);
+
+    if (!await fs.pathExists(baselinePath)) {
+      results.push({ file, hasBaseline: false, changed: true, diffPercent: null });
+      continue;
+    }
+
+    // Compare file sizes first (fast check)
+    const [currentStat, baselineStat] = await Promise.all([
+      fs.stat(currentPath),
+      fs.stat(baselinePath),
+    ]);
+
+    if (currentStat.size === baselineStat.size) {
+      // Compare buffers for exact match
+      const [currentBuf, baselineBuf] = await Promise.all([
+        fs.readFile(currentPath),
+        fs.readFile(baselinePath),
+      ]);
+
+      if (currentBuf.equals(baselineBuf)) {
+        results.push({ file, hasBaseline: true, changed: false, diffPercent: 0 });
+        continue;
+      }
+    }
+
+    // Files differ — calculate approximate diff percentage by byte comparison
+    const [currentBuf, baselineBuf] = await Promise.all([
+      fs.readFile(currentPath),
+      fs.readFile(baselinePath),
+    ]);
+    const minLen = Math.min(currentBuf.length, baselineBuf.length);
+    let diffBytes = Math.abs(currentBuf.length - baselineBuf.length);
+    for (let i = 0; i < minLen; i++) {
+      if (currentBuf[i] !== baselineBuf[i]) diffBytes++;
+    }
+    const maxLen = Math.max(currentBuf.length, baselineBuf.length);
+    const diffPercent = maxLen > 0 ? Math.round((diffBytes / maxLen) * 100) : 0;
+
+    results.push({ file, hasBaseline: true, changed: true, diffPercent });
+  }
+
+  return results;
+}
+
+/**
+ * Save current screenshots as the new baseline.
+ */
+export async function saveBaseline(
+  screenshotsDir: string,
+  baselineDir: string,
+): Promise<void> {
+  await fs.ensureDir(baselineDir);
+  await fs.copy(screenshotsDir, baselineDir, { overwrite: true });
 }
 
 export async function isPlaywrightInstalled(projectPath: string): Promise<boolean> {

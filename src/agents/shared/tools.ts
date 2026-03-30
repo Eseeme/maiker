@@ -3,12 +3,25 @@
  *
  * Provides actual file system and shell tools that agents can call
  * via the LLM tool-use API. Each tool call is executed on disk.
+ *
+ * All operations go through the guards layer for:
+ *   - Path sandboxing (stays within project root)
+ *   - Command allow/deny lists
+ *   - Sensitive file protection
  */
 
 import fs from 'fs-extra';
 import { resolve, dirname } from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import {
+  guardFileOp,
+  guardCommand,
+  parseCommand,
+  type SecurityPolicy,
+  DEFAULT_SECURITY_POLICY,
+} from '../../core/guards/index.js';
+import type { PolicyHooks } from '../../core/hooks/index.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -73,11 +86,21 @@ export async function executeTool(
   toolName: string,
   toolInput: Record<string, string>,
   projectPath: string,
+  securityPolicy?: SecurityPolicy,
+  hooks?: PolicyHooks,
 ): Promise<ToolResult> {
+  const policy = securityPolicy ?? DEFAULT_SECURITY_POLICY;
+
   try {
     switch (toolName) {
       case 'read_file': {
-        const filePath = resolve(projectPath, toolInput.path);
+        // Guard: path sandboxing + sensitive file check
+        const guard = guardFileOp(toolInput.path, projectPath, 'read', policy);
+        if (!guard.allowed) {
+          return { output: `Blocked: ${guard.reason}`, isError: true };
+        }
+        const filePath = guard.resolved!;
+
         if (!await fs.pathExists(filePath)) {
           return { output: `File not found: ${toolInput.path}`, isError: true };
         }
@@ -90,14 +113,40 @@ export async function executeTool(
       }
 
       case 'write_file': {
-        const filePath = resolve(projectPath, toolInput.path);
+        // Guard: path sandboxing + sensitive file + protected file check
+        const guard = guardFileOp(toolInput.path, projectPath, 'write', policy);
+        if (!guard.allowed) {
+          return { output: `Blocked: ${guard.reason}`, isError: true };
+        }
+        const filePath = guard.resolved!;
+
+        // Policy hook: preWrite (no-touch zones, secret scanning)
+        if (hooks) {
+          const hookResult = await hooks.preWrite(filePath, toolInput.content);
+          if (hookResult.blocked) {
+            return { output: `Blocked by policy: ${hookResult.reason}`, isError: true };
+          }
+        }
+
         await fs.ensureDir(dirname(filePath));
         await fs.writeFile(filePath, toolInput.content, 'utf-8');
+
+        // Policy hook: postWrite (auto-formatting)
+        if (hooks) {
+          await hooks.postWrite(filePath);
+        }
+
         return { output: `Written: ${toolInput.path} (${toolInput.content.length} bytes)`, isError: false };
       }
 
       case 'list_directory': {
-        const dirPath = resolve(projectPath, toolInput.path);
+        // Guard: path sandboxing (read operation)
+        const guard = guardFileOp(toolInput.path, projectPath, 'read', policy);
+        if (!guard.allowed) {
+          return { output: `Blocked: ${guard.reason}`, isError: true };
+        }
+        const dirPath = guard.resolved!;
+
         if (!await fs.pathExists(dirPath)) {
           return { output: `Directory not found: ${toolInput.path}`, isError: true };
         }
@@ -109,12 +158,19 @@ export async function executeTool(
       }
 
       case 'run_command': {
-        const [cmd, ...args] = toolInput.command.split(' ');
+        // Guard: command allow/deny list check
+        const guard = guardCommand(toolInput.command, policy);
+        if (!guard.allowed) {
+          return { output: `Blocked: ${guard.reason}`, isError: true };
+        }
+
+        // Parse command safely — uses execFile without shell: true for simple commands
+        const { cmd, args } = parseCommand(toolInput.command);
+
         try {
           const { stdout, stderr } = await execFileAsync(cmd, args, {
             cwd: projectPath,
             timeout: 60_000,
-            shell: true,
             maxBuffer: 1024 * 1024,
           });
           const output = (stdout + (stderr ? `\nSTDERR:\n${stderr}` : '')).trim();

@@ -17,8 +17,8 @@
     "test:watch": "vitest",
     "clean": "rm -rf out || true",
     "prebuild": "npm run clean",
-    "link:local": "npm run build && sudo npm link --ignore-scripts && sudo chown -R $(whoami) dist/",
-    "setup": "rm -rf node_modules dist package-lock.json || true && npm install --legacy-peer-deps && npm run build && sudo npm link --ignore-scripts && sudo chmod +x /usr/local/bin/maiker && echo '\\n✓ maiker installed globally. Run: maiker init'"
+    "link:local": "npm run build && sudo npm link --ignore-scripts && sudo chown -R $(whoami) out/",
+    "setup": "sudo ./scripts/bootstrap.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

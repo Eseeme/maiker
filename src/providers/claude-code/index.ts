@@ -7,10 +7,16 @@
  * with the Anthropic Messages API.
  *
  * How it works:
- *   1. Spawns `claude -p` (print mode) with permission bypass
+ *   1. Spawns `claude -p` (print mode) with scoped permissions
  *   2. Passes system prompt via --system-prompt
  *   3. Claude Code handles tool use (file writes) internally
  *   4. Returns final text output
+ *
+ * Security model:
+ *   - Uses --permission-mode dontAsk (blocks everything not explicitly allowed)
+ *   - Uses --allowedTools to scope reads/writes to the project directory
+ *   - Allows standard build/test/lint commands via Bash patterns
+ *   - No --dangerously-skip-permissions
  *
  * This provider is auto-selected when:
  *   - The user has `claude` installed
@@ -19,10 +25,9 @@
  */
 
 import { execSync, spawn } from 'child_process';
-import { writeFileSync, unlinkSync, mkdtempSync, rmdirSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
 import type { ModelConfig } from '../../types/index.js';
+import type { SecurityPolicy } from '../../core/guards/index.js';
+import { DEFAULT_SECURITY_POLICY } from '../../core/guards/index.js';
 
 export interface LLMMessage {
   role: 'user' | 'assistant';
@@ -68,32 +73,165 @@ export function shouldUseClaudeCode(): boolean {
   return isOAuthToken() && isClaudeCodeAvailable();
 }
 
+// ─── Scoped Permission Builder ───────────────────────────────────────────────
+
 /**
- * Call Claude via the Claude Code CLI subprocess.
+ * Build the --allowedTools patterns for the Claude Code subprocess.
+ * Scopes operations to the project directory and safe commands.
+ */
+function buildAllowedTools(projectPath: string, policy: SecurityPolicy): string[] {
+  const tools: string[] = [];
+
+  // Read access: project-wide (always allowed)
+  tools.push(`Read(${projectPath}/**)`);
+
+  // Write/Edit access: project-wide (workspace and full modes)
+  if (policy.mode !== 'safe') {
+    tools.push(`Edit(${projectPath}/**)`);
+    tools.push(`Write(${projectPath}/**)`);
+  }
+
+  // Glob/Grep for searching (always allowed, read-only)
+  tools.push('Glob');
+  tools.push('Grep');
+
+  // Bash: standard development commands
+  // Build/test/lint (always allowed)
+  tools.push('Bash(npm run *)');
+  tools.push('Bash(npm test *)');
+  tools.push('Bash(npm exec *)');
+  tools.push('Bash(npx *)');
+  tools.push('Bash(yarn run *)');
+  tools.push('Bash(pnpm run *)');
+  tools.push('Bash(bun run *)');
+  tools.push('Bash(node *)');
+  tools.push('Bash(tsc *)');
+  tools.push('Bash(tsx *)');
+
+  // Read-only CLI commands
+  tools.push('Bash(cat *)');
+  tools.push('Bash(ls *)');
+  tools.push('Bash(find *)');
+  tools.push('Bash(grep *)');
+  tools.push('Bash(wc *)');
+  tools.push('Bash(head *)');
+  tools.push('Bash(tail *)');
+
+  if (policy.mode !== 'safe') {
+    // Package management (workspace/full modes)
+    tools.push('Bash(npm install *)');
+    tools.push('Bash(npm add *)');
+    tools.push('Bash(npm ci *)');
+    tools.push('Bash(yarn install *)');
+    tools.push('Bash(yarn add *)');
+    tools.push('Bash(pnpm install *)');
+    tools.push('Bash(pnpm add *)');
+
+    // Git operations (safe subset)
+    tools.push('Bash(git status *)');
+    tools.push('Bash(git diff *)');
+    tools.push('Bash(git log *)');
+    tools.push('Bash(git add *)');
+    tools.push('Bash(git commit *)');
+    tools.push('Bash(git stash *)');
+    tools.push('Bash(git checkout *)');
+    tools.push('Bash(git branch *)');
+    tools.push('Bash(git fetch *)');
+    tools.push('Bash(git pull *)');
+    tools.push('Bash(git worktree *)');
+    tools.push('Bash(git show *)');
+    tools.push('Bash(git rev-parse *)');
+    tools.push('Bash(git tag *)');
+
+    // Directory operations
+    tools.push('Bash(mkdir *)');
+    tools.push('Bash(cp *)');
+    tools.push('Bash(mv *)');
+    tools.push('Bash(rm *)');
+    tools.push('Bash(touch *)');
+    tools.push('Bash(chmod *)');
+
+    // Linting/formatting
+    tools.push('Bash(prettier *)');
+    tools.push('Bash(eslint *)');
+    tools.push('Bash(biome *)');
+
+    // Test runners
+    tools.push('Bash(jest *)');
+    tools.push('Bash(vitest *)');
+    tools.push('Bash(playwright *)');
+  }
+
+  // Add user-defined allowed commands
+  for (const cmd of policy.allowedCommands) {
+    tools.push(`Bash(${cmd})`);
+  }
+
+  return tools;
+}
+
+/**
+ * Build the --disallowedTools patterns for explicit blocks.
+ */
+function buildDisallowedTools(policy: SecurityPolicy): string[] {
+  const tools: string[] = [];
+
+  // Always block dangerous git operations
+  tools.push('Bash(git push --force *)');
+  tools.push('Bash(git push -f *)');
+  tools.push('Bash(git clean -f *)');
+  tools.push('Bash(npm publish *)');
+
+  // Add user-defined blocked commands
+  for (const cmd of policy.blockedCommands) {
+    tools.push(`Bash(${cmd})`);
+  }
+
+  return tools;
+}
+
+// ─── Claude Code Subprocess Execution ────────────────────────────────────────
+
+/**
+ * Call Claude via the Claude Code CLI subprocess with scoped permissions.
  *
  * Uses `claude -p` (print mode) with:
- * - --dangerously-skip-permissions to avoid interactive prompts
- * - --output-format json for structured responses
+ * - --permission-mode dontAsk (block everything not explicitly allowed)
+ * - --allowedTools for scoped read/write/bash access
+ * - --disallowedTools for explicit dangerous command blocks
  * - --model to route to the configured model
  * - --system-prompt for agent instructions
  * - --add-dir for project file access
- *
- * The subprocess runs with full tool access (Read, Write, Edit, Bash, etc.)
- * and uses the user's stored OAuth credentials automatically.
  */
 export async function claudeCodeComplete(
   config: ModelConfig,
   systemPrompt: string,
   userMessage: string,
   projectPath?: string,
+  timeoutMs?: number,
+  securityPolicy?: SecurityPolicy,
 ): Promise<string> {
+  const policy = securityPolicy ?? DEFAULT_SECURITY_POLICY;
+  const resolvedProjectPath = projectPath || process.cwd();
+
   return new Promise((resolve, reject) => {
     const args = [
       '-p',                          // print mode (non-interactive)
       '--model', config.model,
       '--output-format', 'text',
-      '--dangerously-skip-permissions',  // no interactive permission prompts
+      '--permission-mode', 'dontAsk', // block everything not explicitly allowed
     ];
+
+    // Add scoped permissions
+    const allowed = buildAllowedTools(resolvedProjectPath, policy);
+    if (allowed.length > 0) {
+      args.push('--allowedTools', ...allowed);
+    }
+
+    const disallowed = buildDisallowedTools(policy);
+    if (disallowed.length > 0) {
+      args.push('--disallowedTools', ...disallowed);
+    }
 
     // Add system prompt — keep it under OS arg limits
     // If too long, we'll prepend it to the user message via stdin
@@ -109,18 +247,14 @@ export async function claudeCodeComplete(
       args.push('--add-dir', projectPath);
     }
 
-    // Always pipe via stdin — avoids OS arg length limits with long prompts
-    const useStdin = true;
-    // Short messages could be args but stdin is safer for all cases
-
     const child = spawn('claude', args, {
-      cwd: projectPath || process.cwd(),
+      cwd: resolvedProjectPath,
       env: {
         ...process.env,
         CI: '1',  // prevent interactive behavior
       },
       stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 300_000,  // 5 minute timeout
+      timeout: timeoutMs ?? 600_000,  // 10 minute default
     });
 
     let stdout = '';
@@ -166,6 +300,7 @@ export async function claudeCodeChat(
   systemPrompt: string,
   messages: LLMMessage[],
   projectPath?: string,
+  securityPolicy?: SecurityPolicy,
 ): Promise<LLMResponse> {
   const parts: string[] = [];
   for (const msg of messages) {
@@ -181,6 +316,8 @@ export async function claudeCodeChat(
     systemPrompt,
     parts.join('\n\n'),
     projectPath,
+    undefined,
+    securityPolicy,
   );
 
   return {

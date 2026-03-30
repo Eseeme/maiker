@@ -390,6 +390,22 @@ export interface PlaywrightConfig {
   timeout?: number;
 }
 
+export type SecurityMode = 'safe' | 'workspace' | 'full';
+
+export interface SecurityConfig {
+  /** Controls how restrictive tool execution guards are.
+   *  - safe: read-only + build/test commands only
+   *  - workspace: normal development ops within project (default)
+   *  - full: everything not explicitly blocked is allowed */
+  mode: SecurityMode;
+  /** Extra paths (relative to project root) blocked for writes */
+  protectedFiles: string[];
+  /** Extra commands to allow beyond defaults */
+  allowedCommands: string[];
+  /** Extra commands to block beyond defaults */
+  blockedCommands: string[];
+}
+
 export interface PolicyConfig {
   requireHumanApproval: boolean;
   postApprovalReviewRequired: boolean;
@@ -397,6 +413,7 @@ export interface PolicyConfig {
   maxAutoRepairsPerRun: number;
   maxVisualRetries: number;
   stopOnBuildFailure: boolean;
+  security: SecurityConfig;
 }
 
 export interface ArtifactsConfig {

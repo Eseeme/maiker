@@ -760,7 +760,40 @@ The set of validators that run is chosen automatically based on the task type de
 
 You can override which validators run by editing the `validators:` section in `maiker.config.yaml`.
 
-> **Note:** `accessibility` and `mobile_layout_rules` are declared in the type system but **not yet implemented**. Enabling them in config will result in a skip. Contributions welcome.
+> **Note:** `ux_rules`, `accessibility`, and `mobile_layout_rules` are declared in the type system but **not yet implemented as separate validators**. `ux_rules` currently triggers the `visual_review` agent. Contributions welcome.
+>
+> **Maturity:** mAIker is an early-stage experimental orchestrator. The architecture is designed for production use, but the runtime is still being hardened. See the [Security](#security) section for what's implemented.
+
+---
+
+## Security
+
+mAIker includes a layered execution safety system:
+
+| Layer | What it does | Status |
+|-------|-------------|--------|
+| **Path sandboxing** | All file ops validated to stay within project root. Blocks `../../` traversal. | Implemented |
+| **Command allow/deny lists** | Blocks `rm -rf /`, `git push --force`, `sudo`, `curl\|sh`, etc. Three modes: safe, workspace, full. | Implemented |
+| **Sensitive file protection** | Blocks writes to `.env*`, `.pem`, `credentials.json`, SSH keys. | Implemented |
+| **Secret scanning** | Pre-write hook detects API keys, tokens, private keys in file content. | Implemented |
+| **No-touch zone enforcement** | Hard blocks writes to protected paths (not just prompt instructions). | Implemented |
+| **Auto-formatting** | Post-write hook auto-formats via prettier/biome if detected. | Implemented |
+| **Scoped subprocess permissions** | Claude Code subprocess uses `--permission-mode dontAsk` with `--allowedTools` instead of `--dangerously-skip-permissions`. | Implemented |
+| **Worktree isolation** | Parallel subtasks run in isolated git worktrees, merged after completion. | Implemented |
+| **Repair strategy diversity** | Escalating strategies per retry: local fix → root cause → replan → alternate model. | Implemented |
+| **Test impact analysis** | Selective reruns based on changed files. | Planned |
+| **Screenshot diffing** | Before/after visual regression detection. | Planned |
+
+Configure via `maiker.config.yaml`:
+
+```yaml
+policies:
+  security:
+    mode: workspace        # safe | workspace | full
+    protected_files: []    # extra paths blocked for writes
+    allowed_commands: []   # extra commands to allow
+    blocked_commands: []   # extra commands to block
+```
 
 ---
 

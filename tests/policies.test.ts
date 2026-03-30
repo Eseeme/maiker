@@ -6,6 +6,8 @@ import {
   getRepairCount,
   getValidationProfile,
   analyseContextImpact,
+  getRepairStrategy,
+  formatRepairHistory,
 } from '../src/core/policies/index.js';
 import type { PolicyConfig, TaskClassification } from '../src/types/index.js';
 
@@ -16,6 +18,12 @@ const defaultPolicy: PolicyConfig = {
   maxAutoRepairsPerRun: 6,
   maxVisualRetries: 2,
   stopOnBuildFailure: false,
+  security: {
+    mode: 'workspace',
+    protectedFiles: [],
+    allowedCommands: [],
+    blockedCommands: [],
+  },
 };
 
 describe('shouldEscalate', () => {
@@ -154,5 +162,71 @@ describe('analyseContextImpact', () => {
   it('returns low for neutral context', () => {
     expect(analyseContextImpact('The sky is blue', 'EXECUTE')).toBe('low');
     expect(analyseContextImpact('Looks good so far', 'VALIDATE_VISUAL')).toBe('low');
+  });
+});
+
+describe('getRepairStrategy', () => {
+  it('returns local_fix for attempt 1', () => {
+    const strategy = getRepairStrategy(1);
+    expect(strategy.strategy).toBe('local_fix');
+    expect(strategy.strategyPrompt).toMatch(/LOCAL FIX/);
+    expect(strategy.alternateModelKey).toBeUndefined();
+  });
+
+  it('returns root_cause for attempt 2', () => {
+    const strategy = getRepairStrategy(2);
+    expect(strategy.strategy).toBe('root_cause');
+    expect(strategy.strategyPrompt).toMatch(/ROOT CAUSE/);
+    expect(strategy.temperature).toBe(0.3);
+  });
+
+  it('returns partial_replan for attempt 3', () => {
+    const strategy = getRepairStrategy(3);
+    expect(strategy.strategy).toBe('partial_replan');
+    expect(strategy.strategyPrompt).toMatch(/PARTIAL REPLAN/);
+    expect(strategy.temperature).toBe(0.5);
+  });
+
+  it('returns alternate_model for attempt 4', () => {
+    const strategy = getRepairStrategy(4);
+    expect(strategy.strategy).toBe('alternate_model');
+    expect(strategy.alternateModelKey).toBe('planner');
+    expect(strategy.strategyPrompt).toMatch(/FRESH PERSPECTIVE/);
+  });
+
+  it('returns escalate for attempt 5+', () => {
+    expect(getRepairStrategy(5).strategy).toBe('escalate');
+    expect(getRepairStrategy(10).strategy).toBe('escalate');
+  });
+
+  it('each strategy has a different prompt', () => {
+    const prompts = [1, 2, 3, 4].map(n => getRepairStrategy(n).strategyPrompt);
+    const uniquePrompts = new Set(prompts);
+    expect(uniquePrompts.size).toBe(4);
+  });
+});
+
+describe('formatRepairHistory', () => {
+  it('returns message for empty history', () => {
+    expect(formatRepairHistory([])).toBe('No prior attempts.');
+  });
+
+  it('formats structured repair records', () => {
+    const history = [
+      {
+        attemptNumber: 1,
+        strategy: 'local_fix' as const,
+        issueId: 'issue-1',
+        patchPlan: 'Fixed missing import',
+        changedFiles: ['src/index.ts'],
+        outcome: 'still_failing' as const,
+        description: 'Added import but type error persists',
+      },
+    ];
+    const formatted = formatRepairHistory(history);
+    expect(formatted).toContain('Attempt 1');
+    expect(formatted).toContain('local_fix');
+    expect(formatted).toContain('still_failing');
+    expect(formatted).toContain('src/index.ts');
   });
 });

@@ -4,11 +4,16 @@ import type {
   MaikerConfig,
 } from '../../types/index.js';
 import { runToolLoop } from '../shared/tool-loop.js';
-import { callModel, parseJsonFromResponse } from '../shared/base.js';
-import fs from 'fs-extra';
-import { resolve, dirname } from 'path';
+import type { SecurityPolicy } from '../../core/guards/index.js';
+import { DEFAULT_SECURITY_POLICY } from '../../core/guards/index.js';
+import { createHooks } from '../../core/hooks/index.js';
+import {
+  getRepairStrategy,
+  formatRepairHistory,
+  type RepairAttemptRecord,
+} from '../../core/policies/index.js';
 
-const TOOL_SYSTEM_PROMPT = `You are the Repair Agent for mAIker.
+const BASE_SYSTEM_PROMPT = `You are the Repair Agent for mAIker.
 You have tools to read files, write files, list directories, and run commands.
 
 You are receiving structured validator failures. Your job:
@@ -23,55 +28,61 @@ Rules:
 - Preserve approved behavior
 - Do not remove assertions to make tests pass
 - Use the validator evidence as the source of truth
-- Check "issueAttempts" — if this is attempt 2+, try a DIFFERENT approach
-- Check "priorRepairNotes" to see what was already tried and avoid repeating
+- Review the repair history carefully to avoid repeating failed approaches
 
 When done, respond with a brief summary of what you fixed.`;
-
-const FALLBACK_SYSTEM_PROMPT = `You are the Repair Agent for mAIker.
-You are receiving structured validator failures for a specific subtask.
-Apply the smallest safe patch that resolves the issue without introducing regressions.
-
-Rules:
-- only change relevant files
-- do not redesign unless necessary
-- preserve approved behavior
-- do not remove assertions to make tests pass
-- use evidence as the source of truth
-- check the "issueAttempts" to see how many times each issue has been tried
-- if this is attempt 2+, try a DIFFERENT approach than previous attempts
-- check "priorRepairNotes" to see what was already tried and avoid repeating
-
-You MUST return the COMPLETE file contents for every file you modify.
-
-Return a JSON object with this exact shape:
-{
-  "patchPlan": "string describing the minimal patch to apply",
-  "changedFiles": ["relative/path/to/file.ts"],
-  "files": [
-    {
-      "path": "relative/path/to/file.ts",
-      "content": "the FULL file content to write to disk"
-    }
-  ],
-  "expectedImpact": "string describing what should be fixed",
-  "residualRisk": "string describing remaining risks"
-}
-
-IMPORTANT:
-- "files" must contain one entry for every path listed in "changedFiles"
-- "content" must be the COMPLETE file content, not a diff or partial snippet
-- Return ONLY the JSON object.`;
 
 export async function runRepairAgent(
   input: RepairAgentInput,
   config: MaikerConfig,
 ): Promise<RepairAgentOutput> {
-  const modelConfig = config.models.repairAgent;
+  // Determine the current attempt number for strategy selection
+  const maxAttempt = Math.max(
+    input.priorAttempts,
+    ...Object.values(input.issueAttempts).map(Number),
+    0,
+  );
+  const currentAttempt = maxAttempt + 1;
+
+  // Get the escalating strategy for this attempt
+  const strategyConfig = getRepairStrategy(currentAttempt);
+
+  // Select model: use alternate model on attempt 4+ if available
+  let modelConfig = config.models.repairAgent;
+  if (strategyConfig.alternateModelKey && config.models[strategyConfig.alternateModelKey]) {
+    modelConfig = config.models[strategyConfig.alternateModelKey];
+    console.log(`    [repair] Using alternate model: ${modelConfig.provider}/${modelConfig.model} (strategy: ${strategyConfig.strategy})`);
+  }
+
+  // Apply temperature override if strategy calls for it
+  if (strategyConfig.temperature !== undefined) {
+    modelConfig = { ...modelConfig, temperature: strategyConfig.temperature };
+  }
+
+  const securityPolicy: SecurityPolicy = config.policies.security ?? DEFAULT_SECURITY_POLICY;
+  const hooks = createHooks(config, input.projectPath);
+
+  // Build the strategy-augmented system prompt
+  const systemPrompt = `${BASE_SYSTEM_PROMPT}
+
+${strategyConfig.strategyPrompt}`;
+
+  // Format structured repair history
+  const structuredHistory: RepairAttemptRecord[] = input.priorRepairNotes.map((note, i) => ({
+    attemptNumber: i + 1,
+    strategy: getRepairStrategy(i + 1).strategy,
+    issueId: 'unknown',
+    patchPlan: note,
+    changedFiles: [],
+    outcome: 'still_failing' as const,
+    description: note,
+  }));
 
   const userMessage = `
 Goal: ${input.goal}
 Project: ${input.projectPath}
+
+Current Repair Strategy: ${strategyConfig.strategy.toUpperCase()} (attempt ${currentAttempt})
 
 Open Issues:
 ${JSON.stringify(input.issues, null, 2)}
@@ -82,61 +93,41 @@ ${input.validatorEvidence}
 Touched Files:
 ${input.touchedFiles.join('\n') || 'None recorded'}
 
-Prior Repair Attempts (total): ${input.priorAttempts}
-
 Per-Issue Attempt Counts:
 ${Object.entries(input.issueAttempts).map(([id, n]) => `- ${id}: attempt ${n}`).join('\n') || 'First attempt for all'}
 
-Previous Repair Notes (what was already tried):
-${input.priorRepairNotes.length > 0 ? input.priorRepairNotes.map((n, i) => `[attempt ${i + 1}] ${n}`).join('\n') : 'No prior attempts'}
+Repair History (what was tried and failed):
+${formatRepairHistory(structuredHistory)}
 
 Additional Context:
 ${input.context ?? 'None'}
 
-Read the failing files, apply minimal fixes, and verify if possible.
+Read the failing files, apply fixes using the ${strategyConfig.strategy.toUpperCase()} strategy, and verify if possible.
 `.trim();
 
-  // Use tool loop for Claude — actually fixes files on disk
-  if (modelConfig.provider === 'claude') {
-    const result = await runToolLoop({
-      modelConfig,
-      systemPrompt: TOOL_SYSTEM_PROMPT,
-      userMessage,
-      projectPath: input.projectPath,
-      onToolCall: (name, toolInput) => {
-        if (name === 'write_file') {
-          console.log(`    [repair] write: ${toolInput.path}`);
-        } else if (name === 'run_command') {
-          console.log(`    [repair] run: ${toolInput.command}`);
-        }
-      },
-    });
+  console.log(`    [repair] Strategy: ${strategyConfig.strategy} (attempt ${currentAttempt})`);
 
-    return {
-      patchPlan: result.finalText || `Applied fixes to ${result.changedFiles.length} file(s)`,
-      changedFiles: result.changedFiles,
-      expectedImpact: 'Issues should be resolved by the applied patches',
-      residualRisk: '',
-    };
-  }
-
-  // Fallback for non-Claude providers — parse JSON and write files to disk
-  const raw = await callModel(modelConfig, FALLBACK_SYSTEM_PROMPT, userMessage);
-  const parsed = parseJsonFromResponse<RepairAgentOutput & { files?: { path: string; content: string }[] }>(raw);
-
-  if (parsed.files && parsed.files.length > 0) {
-    for (const file of parsed.files) {
-      const filePath = resolve(input.projectPath, file.path);
-      await fs.ensureDir(dirname(filePath));
-      await fs.writeFile(filePath, file.content, 'utf-8');
-      console.log(`    [repair] write: ${file.path}`);
-    }
-  }
+  // All providers go through the unified tool loop
+  const result = await runToolLoop({
+    modelConfig,
+    systemPrompt,
+    userMessage,
+    projectPath: input.projectPath,
+    securityPolicy,
+    hooks,
+    onToolCall: (name, toolInput) => {
+      if (name === 'write_file') {
+        console.log(`    [repair] write: ${toolInput.path}`);
+      } else if (name === 'run_command') {
+        console.log(`    [repair] run: ${toolInput.command}`);
+      }
+    },
+  });
 
   return {
-    patchPlan: parsed.patchPlan,
-    changedFiles: parsed.changedFiles,
-    expectedImpact: parsed.expectedImpact,
-    residualRisk: parsed.residualRisk,
+    patchPlan: result.finalText || `Applied fixes to ${result.changedFiles.length} file(s)`,
+    changedFiles: result.changedFiles,
+    expectedImpact: `Strategy: ${strategyConfig.strategy}. Issues should be resolved.`,
+    residualRisk: currentAttempt >= 3 ? 'Multiple repair attempts — review changes carefully.' : '',
   };
 }

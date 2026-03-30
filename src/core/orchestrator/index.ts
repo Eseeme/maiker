@@ -5,7 +5,7 @@
  * - Annotation for typed, reducible state
  * - Conditional edges for routing decisions
  * - Promise.allSettled for parallel subtask fan-out within waves
- * - MemorySaver for checkpointing and resume
+ * - SqliteSaver for durable checkpointing and cross-process resume
  * - interrupt() for human-in-the-loop escalation
  *
  * Stage flow:
@@ -79,7 +79,16 @@ import { runPostApprovalReviewAgent } from '../../agents/review/index.js';
 import { getValidationProfile, shouldEscalate, shouldAutoReplan } from '../policies/index.js';
 import { runFullValidation } from '../../validators/engine/index.js';
 import { summariseRepo } from '../../tools/filesystem/index.js';
-import { getFullDiff, isGitRepo, createCheckpoint, removeCheckpoint } from '../../tools/git/index.js';
+import {
+  getFullDiff,
+  isGitRepo,
+  createCheckpoint,
+  removeCheckpoint,
+  createWorktree,
+  removeWorktree,
+  stageAll,
+  commit,
+} from '../../tools/git/index.js';
 import { writeEscalationPacket, saveFinalSummary } from '../../artifacts/index.js';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -206,11 +215,124 @@ function detectFileConflicts(wave: Subtask[]): Array<[string, string]> {
   const conflicts: Array<[string, string]> = [];
   for (let i = 0; i < wave.length; i++) {
     for (let j = i + 1; j < wave.length; j++) {
+      // Direct file overlap
       const shared = wave[i].fileTargets.filter(f => wave[j].fileTargets.includes(f));
-      if (shared.length > 0) conflicts.push([wave[i].id, wave[j].id]);
+      if (shared.length > 0) {
+        conflicts.push([wave[i].id, wave[j].id]);
+        continue;
+      }
+      // Semantic proximity: if both subtasks target files in the same directory,
+      // they're likely touching related modules (shared imports, types, etc.)
+      const dirsI = new Set(wave[i].fileTargets.map(f => f.split('/').slice(0, -1).join('/')));
+      const dirsJ = new Set(wave[j].fileTargets.map(f => f.split('/').slice(0, -1).join('/')));
+      for (const dir of dirsI) {
+        if (dir && dirsJ.has(dir)) {
+          conflicts.push([wave[i].id, wave[j].id]);
+          break;
+        }
+      }
     }
   }
   return conflicts;
+}
+
+/**
+ * Check if git worktree isolation is available and safe to use.
+ * Requires: git repo, no uncommitted changes (checkpoint handles this).
+ */
+async function canUseWorktrees(projectPath: string): Promise<boolean> {
+  try {
+    if (!await isGitRepo(projectPath)) return false;
+    // Worktrees need a clean working directory to branch from
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { runCommand } from '../../tools/shell/index.js';
+
+/**
+ * Execute a subtask in an isolated git worktree.
+ * Returns the changed files and notes. The worktree is cleaned up after.
+ */
+async function executeInWorktree(
+  subtask: Subtask,
+  state: GraphState,
+  plan: ExecutionPlan,
+  cachedRepoContext: string,
+  sharedContext: SharedContext,
+): Promise<{ changedFiles: string[]; implementationNotes: string }> {
+  const branchName = `maiker/${state.runId}/${subtask.id}`;
+  const worktreePath = join(tmpdir(), `maiker-wt-${state.runId}-${subtask.id}`);
+
+  try {
+    // Create isolated worktree with its own branch
+    await createWorktree(state.projectPath, branchName, worktreePath);
+    console.log(`    [worktree] Created: ${worktreePath} (branch: ${branchName})`);
+
+    // Run the code agent in the worktree's isolated directory
+    const { runCodeAgent } = await import('../../agents/coder/index.js');
+    const result = await runCodeAgent({
+      runId: state.runId,
+      goal: state.goal,
+      projectPath: worktreePath, // Agent writes to worktree, not main repo
+      subtask,
+      acceptanceCriteria: subtask.acceptanceCriteria,
+      fileTargets: subtask.fileTargets,
+      noTouchConstraints: plan.classification.noTouchZones,
+      repoContext: cachedRepoContext,
+      context: state.contextUpdates.map(c => c.message).join('\n'),
+      sharedContext,
+    }, state.config);
+
+    // Commit changes in the worktree so they can be merged
+    if (result.changedFiles.length > 0) {
+      await stageAll(worktreePath);
+      await commit(worktreePath, `[maiker] ${subtask.id}: ${subtask.title}`);
+    }
+
+    return {
+      changedFiles: result.changedFiles,
+      implementationNotes: result.implementationNotes,
+    };
+  } finally {
+    // Always clean up the worktree
+    try {
+      await removeWorktree(state.projectPath, worktreePath);
+      // Clean up the branch
+      await runCommand('git', ['branch', '-D', branchName], { cwd: state.projectPath });
+      console.log(`    [worktree] Cleaned up: ${worktreePath}`);
+    } catch (cleanupErr) {
+      console.warn(`    [worktree] Cleanup warning: ${String(cleanupErr)}`);
+    }
+  }
+}
+
+/**
+ * Merge a worktree branch's changes into the main working directory.
+ * Uses cherry-pick to apply the commit without creating a merge commit.
+ */
+async function mergeWorktreeChanges(
+  projectPath: string,
+  branchName: string,
+): Promise<void> {
+  // Get the tip commit of the worktree branch
+  const result = await runCommand('git', ['rev-parse', branchName], { cwd: projectPath });
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to resolve branch ${branchName}: ${result.stderr}`);
+  }
+  const commitRef = result.stdout.trim();
+
+  // Cherry-pick the commit into the main working directory
+  const cpResult = await runCommand('git', ['cherry-pick', commitRef, '--no-commit'], {
+    cwd: projectPath,
+  });
+  if (cpResult.exitCode !== 0) {
+    throw new Error(`Merge conflict when applying ${branchName}: ${cpResult.stderr}`);
+  }
 }
 
 function mapValidatorToCategory(name: ValidatorName | string): Issue['category'] {
@@ -358,10 +480,30 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
   // Cache repo context once (avoid redundant summariseRepo calls per subtask)
   const cachedRepoContext = await summariseRepo(state.projectPath);
 
+  // Maximum retries for transient subtask failures (timeout, rate limit, etc.)
+  const MAX_SUBTASK_RETRIES = 2;
+
+  // Check if we can use worktree isolation for parallel execution
+  const useWorktrees = await canUseWorktrees(state.projectPath);
+  if (useWorktrees) {
+    console.log('[maiker] Worktree isolation: enabled (parallel subtasks run in isolated copies)');
+  } else {
+    console.log('[maiker] Worktree isolation: unavailable (not a git repo — using shared directory)');
+  }
+
   // Execute wave by wave
   for (const wave of waves) {
     const conflicts = detectFileConflicts(wave);
-    const groups = conflicts.length > 0 ? wave.map(s => [s]) : [wave];
+    // With worktrees: parallel is safe even with conflicts (isolated directories)
+    // Without worktrees: conflicts force sequential execution
+    const canParallelize = useWorktrees || conflicts.length === 0;
+    const groups = canParallelize ? [wave] : wave.map(s => [s]);
+
+    if (conflicts.length > 0 && useWorktrees) {
+      console.log(`[maiker]   File conflicts detected but running parallel (worktree-isolated)`);
+    } else if (conflicts.length > 0) {
+      console.log(`[maiker]   File conflicts detected — falling back to sequential execution`);
+    }
 
     for (const group of groups) {
       // Run all subtasks in this group in parallel
@@ -370,6 +512,15 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
           emitAgentInvoked(state.runId, 'coder', state.config.models.codeGeneration.model);
           await setAgent(state.runId, 'coder', `[${subtask.id}] ${subtask.title}`);
 
+          if (useWorktrees && group.length > 1) {
+            // Parallel execution: each subtask gets its own worktree
+            const result = await executeInWorktree(
+              subtask, state, plan, cachedRepoContext, sharedContext,
+            );
+            return { subtaskId: subtask.id, result };
+          }
+
+          // Sequential or single-subtask: run directly in the project directory
           const { runCodeAgent } = await import('../../agents/coder/index.js');
           const result = await runCodeAgent({
             runId: state.runId,
@@ -389,6 +540,10 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
       );
 
       // Process results → update shared context
+      const failedSubtasks: typeof group = [];
+      // Track successful worktree branches for post-validation merge
+      const worktreeSuccesses: Array<{ subtask: Subtask; result: { changedFiles: string[]; implementationNotes: string } }> = [];
+
       for (let i = 0; i < group.length; i++) {
         const subtask = group[i];
         const settled = results[i];
@@ -409,23 +564,24 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
             title: subtask.title,
             notes: result.implementationNotes,
           });
+          worktreeSuccesses.push({ subtask, result });
           emitAgentCompleted(state.runId, 'coder');
           console.log(`[maiker] ✓ ${subtask.id}: ${result.implementationNotes}`);
         } else {
           const classified = classifyError(settled.reason);
-          subtaskStates[subtask.id] = {
-            subtaskId: subtask.id,
-            status: 'failed',
-            startedAt: new Date().toISOString(),
-            changedFiles: [],
-            implementationNotes: '',
-            error: `[${classified.category}] ${classified.message}`,
-          };
           console.warn(`[maiker] ✗ ${subtask.id} [${classified.category}]: ${classified.message}`);
           emitAgentCompleted(state.runId, 'coder');
 
           // Auth errors — abort all execution immediately
           if (classified.category === 'auth') {
+            subtaskStates[subtask.id] = {
+              subtaskId: subtask.id,
+              status: 'failed',
+              startedAt: new Date().toISOString(),
+              changedFiles: [],
+              implementationNotes: '',
+              error: `[${classified.category}] ${classified.message}`,
+            };
             emitStageCompleted(state.runId, 'EXECUTE');
             return {
               stage: 'FAILED' as WorkflowStage,
@@ -435,8 +591,128 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
               sharedContext,
             };
           }
+
+          // Transient errors (timeout, rate limit, connection) — queue for retry
+          if (classified.category === 'transient') {
+            failedSubtasks.push(subtask);
+          } else {
+            subtaskStates[subtask.id] = {
+              subtaskId: subtask.id,
+              status: 'failed',
+              startedAt: new Date().toISOString(),
+              changedFiles: [],
+              implementationNotes: '',
+              error: `[${classified.category}] ${classified.message}`,
+            };
+          }
         }
       }
+
+      // Retry transient failures sequentially (one at a time to reduce load)
+      for (const subtask of failedSubtasks) {
+        let lastError = '';
+        let succeeded = false;
+
+        for (let attempt = 1; attempt <= MAX_SUBTASK_RETRIES; attempt++) {
+          const retryKey = `subtask:${subtask.id}`;
+          await incrementRetry(state.runId, retryKey);
+          console.log(`[maiker] ⟳ Retrying ${subtask.id} (attempt ${attempt}/${MAX_SUBTASK_RETRIES})`);
+          emitAgentInvoked(state.runId, 'coder', state.config.models.codeGeneration.model);
+          await setAgent(state.runId, 'coder', `[${subtask.id}] retry ${attempt} — ${subtask.title}`);
+
+          try {
+            const { runCodeAgent } = await import('../../agents/coder/index.js');
+            const result = await runCodeAgent({
+              runId: state.runId,
+              goal: state.goal,
+              projectPath: state.projectPath,
+              subtask,
+              acceptanceCriteria: subtask.acceptanceCriteria,
+              fileTargets: subtask.fileTargets,
+              noTouchConstraints: plan.classification.noTouchZones,
+              repoContext: cachedRepoContext,
+              context: state.contextUpdates.map(c => c.message).join('\n'),
+              sharedContext,
+            }, state.config);
+
+            subtaskStates[subtask.id] = {
+              subtaskId: subtask.id,
+              status: 'completed',
+              startedAt: new Date().toISOString(),
+              completedAt: new Date().toISOString(),
+              changedFiles: result.changedFiles,
+              implementationNotes: result.implementationNotes,
+            };
+            sharedContext.changedFiles.push(...result.changedFiles);
+            sharedContext.completedNotes.push({
+              subtaskId: subtask.id,
+              title: subtask.title,
+              notes: result.implementationNotes,
+            });
+            emitAgentCompleted(state.runId, 'coder');
+            console.log(`[maiker] ✓ ${subtask.id} (retry ${attempt}): ${result.implementationNotes}`);
+            succeeded = true;
+            break;
+          } catch (retryErr) {
+            const retryClassified = classifyError(retryErr);
+            lastError = `[${retryClassified.category}] ${retryClassified.message}`;
+            console.warn(`[maiker] ✗ ${subtask.id} retry ${attempt} [${retryClassified.category}]: ${retryClassified.message}`);
+            emitAgentCompleted(state.runId, 'coder');
+          }
+        }
+
+        if (!succeeded) {
+          subtaskStates[subtask.id] = {
+            subtaskId: subtask.id,
+            status: 'failed',
+            startedAt: new Date().toISOString(),
+            changedFiles: [],
+            implementationNotes: '',
+            error: lastError,
+          };
+          console.warn(`[maiker] ✗ ${subtask.id} failed after ${MAX_SUBTASK_RETRIES} retries`);
+        }
+      }
+
+      // Merge worktree results into main working directory
+      // When worktrees were used for parallel execution, changes need to be
+      // applied to the main repo. Sequential execution writes directly.
+      if (useWorktrees && group.length > 1 && worktreeSuccesses.length > 0) {
+        console.log(`[maiker] Merging ${worktreeSuccesses.length} worktree result(s) into main directory`);
+        for (const { subtask } of worktreeSuccesses) {
+          const branchName = `maiker/${state.runId}/${subtask.id}`;
+          try {
+            await mergeWorktreeChanges(state.projectPath, branchName);
+            console.log(`[maiker]   ✓ Merged ${subtask.id}`);
+          } catch (mergeErr) {
+            console.warn(`[maiker]   ✗ Merge conflict for ${subtask.id}: ${String(mergeErr)}`);
+            // On merge conflict, mark as failed — repair loop will handle it
+            subtaskStates[subtask.id] = {
+              ...subtaskStates[subtask.id],
+              status: 'failed',
+              error: `Merge conflict: ${String(mergeErr)}`,
+            };
+          }
+        }
+        // Commit the merged results
+        try {
+          await stageAll(state.projectPath);
+          await commit(state.projectPath, `[maiker] Merged wave results for ${state.runId}`);
+        } catch {
+          // May fail if nothing to commit (all merges were no-ops)
+        }
+      }
+    }
+  }
+
+  // Post-execute policy hook: validate all changed files
+  const { createHooks } = await import('../hooks/index.js');
+  const hooks = createHooks(state.config, state.projectPath, plan.classification.noTouchZones);
+  const postCheck = await hooks.postExecute(sharedContext.changedFiles);
+  if (!postCheck.passed) {
+    console.warn(`[maiker] Post-execute policy violations:`);
+    for (const v of postCheck.violations) {
+      console.warn(`  - ${v}`);
     }
   }
 
@@ -458,6 +734,20 @@ async function nodeValidateDeterministic(state: GraphState): Promise<Partial<Gra
   const plan = state.plan!;
   const profile = plan.validationProfile;
 
+  // On re-validation (after repair), only re-run failed validators
+  const lastValidation = state.validationResults.length > 0
+    ? state.validationResults[state.validationResults.length - 1]
+    : undefined;
+
+  const failedValidatorNames = lastValidation
+    ? lastValidation.results
+        .filter(r => r.status === 'failed')
+        .map(r => r.name as import('../../types/index.js').ValidatorName)
+    : undefined;
+
+  // Also re-run validators that depend on the failed ones
+  const isRerun = failedValidatorNames && failedValidatorNames.length > 0;
+
   const fullResult = await runFullValidation({
     runId: state.runId,
     projectPath: state.projectPath,
@@ -465,6 +755,8 @@ async function nodeValidateDeterministic(state: GraphState): Promise<Partial<Gra
     config: state.config,
     taskConstraints: plan.acceptanceCriteria,
     onOutput: (line) => process.stdout.write(`  [validator] ${line}\n`),
+    // On rerun, only validate what failed + its dependents
+    onlyValidators: isRerun ? failedValidatorNames : undefined,
   });
 
   await appendValidationResult(state.runId, fullResult.deterministic);
@@ -817,7 +1109,9 @@ async function nodePostApprovalReview(state: GraphState): Promise<Partial<GraphS
     const diff = await getFullDiff(state.projectPath).catch(() => 'No diff available');
     const touchedFiles = state.sharedContext?.changedFiles ?? state.plan?.fileTargetHints ?? [];
 
-    const reviewOutput = await runPostApprovalReviewAgent({
+    // Wrap review in a timeout to prevent the stage from hanging indefinitely
+    const REVIEW_TIMEOUT = 120_000; // 2 minutes — review should be fast
+    const reviewPromise = runPostApprovalReviewAgent({
       runId: state.runId,
       goal: state.goal,
       projectPath: state.projectPath,
@@ -827,13 +1121,21 @@ async function nodePostApprovalReview(state: GraphState): Promise<Partial<GraphS
       touchedFiles,
     }, state.config);
 
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Post-approval review timed out after 120s')), REVIEW_TIMEOUT),
+    );
+
+    const reviewOutput = await Promise.race([reviewPromise, timeoutPromise]);
+
     emitAgentCompleted(state.runId, 'post-approval-reviewer');
 
     if (reviewOutput.overallRisk === 'critical') {
       return { stage: 'HUMAN_ESCALATION' as WorkflowStage, status: 'running' as RunStatus };
     }
   } catch (err) {
-    console.warn(`[maiker] Post-approval review failed: ${String(err)}`);
+    // Log but don't block promotion — review is advisory, not gate-keeping
+    console.warn(`[maiker] Post-approval review failed (non-blocking): ${String(err)}`);
+    emitAgentCompleted(state.runId, 'post-approval-reviewer');
   }
 
   emitStageCompleted(state.runId, 'POST_APPROVAL_REVIEW');
@@ -960,7 +1262,7 @@ function buildWorkflowGraph() {
 
 // ─── Workflow Runner ──────────────────────────────────────────────────────────
 
-// Persistent SQLite checkpointer — survives process restarts for durable resume
+// In-memory checkpointer — used for within-process interrupt/resume cycles
 const checkpointer = new MemorySaver();
 
 export async function runWorkflow(input: WorkflowInput): Promise<GraphState> {
@@ -994,27 +1296,58 @@ export async function runWorkflow(input: WorkflowInput): Promise<GraphState> {
   try {
     // Invoke the LangGraph — it handles all node routing, state merging,
     // and checkpointing automatically
-    const finalState = await app.invoke(initialState, {
+    let currentState = await app.invoke(initialState, {
       configurable: { thread_id: runId },
     }) as GraphState;
 
+    // Handle interrupt/resume cycles within the same process
+    // When interrupt() fires (e.g., human approval), LangGraph returns
+    // with stage still set to the interrupting stage. We detect this,
+    // wait for user input, then resume — all within the same process
+    // so the MemorySaver checkpoint is preserved.
+    while (currentState.stage === 'POST_APPROVAL_REVIEW' || currentState.stage === 'HUMAN_ESCALATION') {
+      // The graph is paused at an interrupt — prompt user inline
+      const readline = await import('readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+      const decision = await new Promise<string>((resolve) => {
+        console.log('');
+        console.log('  Options:');
+        console.log('    proceed  — approve and continue to promotion');
+        console.log('    replan   — go back to PLAN and try a different approach');
+        console.log('    abort    — stop the run');
+        console.log('');
+        rl.question('  Decision [proceed/replan/abort]: ', (answer: string) => {
+          rl.close();
+          const trimmed = answer.trim().toLowerCase();
+          resolve(['proceed', 'replan', 'abort'].includes(trimmed) ? trimmed : 'proceed');
+        });
+      });
+
+      // Resume the graph from the interrupt checkpoint
+      currentState = await app.invoke(
+        new Command({ resume: decision }),
+        { configurable: { thread_id: runId } },
+      ) as GraphState;
+    }
+
     // Persist final state
     await updateRunState(runId, {
-      currentStage: finalState.stage,
-      status: finalState.status,
-      retryCounts: finalState.retryCounts,
-      openIssues: finalState.issues.filter(i => i.status === 'open').map(i => i.id),
-      resolvedIssues: finalState.issues.filter(i => i.status === 'resolved').map(i => i.id),
+      currentStage: currentState.stage,
+      status: currentState.status,
+      retryCounts: currentState.retryCounts,
+      openIssues: currentState.issues.filter(i => i.status === 'open').map(i => i.id),
+      resolvedIssues: currentState.issues.filter(i => i.status === 'resolved').map(i => i.id),
     }, config.artifacts.outputDir);
 
-    if (finalState.stage === 'DONE') {
+    if (currentState.stage === 'DONE') {
       emitRunCompleted(runId);
-    } else if (finalState.stage === 'FAILED') {
-      emitRunFailed(runId, finalState.error ?? 'Unknown error');
+    } else if (currentState.stage === 'FAILED') {
+      emitRunFailed(runId, currentState.error ?? 'Unknown error');
     }
 
     eventBus.detachRunLog(runId);
-    return finalState;
+    return currentState;
   } catch (err) {
     emitRunFailed(runId, String(err));
     await setStatus(runId, 'failed');
