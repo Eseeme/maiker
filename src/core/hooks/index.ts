@@ -47,26 +47,14 @@ export interface PostExecuteResult {
   violations: string[];
 }
 
-// ─── Secret Patterns ─────────────────────────────────────────────────────────
+// ─── Secret Patterns (imported from dedicated module) ────────────────────────
 
-const SECRET_PATTERNS = [
-  // API keys
-  /(?:api[_-]?key|apikey)\s*[:=]\s*['"][A-Za-z0-9_\-]{20,}['"]/i,
-  // AWS keys
-  /AKIA[0-9A-Z]{16}/,
-  // Generic tokens
-  /(?:secret|token|password|passwd|pwd)\s*[:=]\s*['"][^'"]{8,}['"]/i,
-  // Private keys
-  /-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----/,
-  // JWT tokens
-  /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
-  // GitHub tokens
-  /gh[ps]_[A-Za-z0-9]{36,}/,
-  // Anthropic keys
-  /sk-ant-[A-Za-z0-9_-]{20,}/,
-  // OpenAI keys
-  /sk-[A-Za-z0-9]{20,}T3BlbkFJ/,
-];
+import {
+  SECRET_PATTERNS,
+  SECRET_VARIABLE_HINTS,
+  isHighEntropySecret,
+  runGitleaks,
+} from './secret-patterns.js';
 
 // ─── No-Touch Zone Enforcement ───────────────────────────────────────────────
 
@@ -107,14 +95,29 @@ function scanForSecrets(content: string, filePath: string): HookResult {
   }
   if (skipExts.includes(ext)) return { blocked: false };
 
-  for (const pattern of SECRET_PATTERNS) {
+  // Check against known secret patterns
+  for (const { pattern, label } of SECRET_PATTERNS) {
     if (pattern.test(content)) {
       return {
         blocked: true,
-        reason: `Secret detected in ${filePath}: content matches pattern ${pattern.source.slice(0, 40)}...`,
+        reason: `Secret detected in ${filePath}: ${label}`,
       };
     }
   }
+
+  // Entropy-based detection: check values assigned to suspicious variable names
+  SECRET_VARIABLE_HINTS.lastIndex = 0;
+  let match;
+  while ((match = SECRET_VARIABLE_HINTS.exec(content)) !== null) {
+    const value = match[1];
+    if (isHighEntropySecret(value)) {
+      return {
+        blocked: true,
+        reason: `High-entropy secret detected in ${filePath}: suspicious value assigned to secret-like variable`,
+      };
+    }
+  }
+
   return { blocked: false };
 }
 
@@ -206,6 +209,12 @@ async function validateChangedFiles(
     violations.push('package.json was modified but no lockfile was updated — run install to sync');
   }
 
+  // External secret scanner (gitleaks) — additive, runs alongside regex scan
+  try {
+    const gitleaksFindings = await runGitleaks(projectPath, changedFiles);
+    violations.push(...gitleaksFindings);
+  } catch { /* gitleaks not available — no-op */ }
+
   // Forbidden file class check — binary/large files that agents shouldn't create
   const forbiddenExts = ['.exe', '.dll', '.so', '.dylib', '.bin', '.dat', '.zip', '.tar', '.gz'];
   for (const file of changedFiles) {
@@ -287,4 +296,5 @@ export function createHooks(
 
 // ─── Convenience export for testing ──────────────────────────────────────────
 
-export { checkNoTouchZones, scanForSecrets, SECRET_PATTERNS };
+export { checkNoTouchZones, scanForSecrets };
+export { SECRET_PATTERNS } from './secret-patterns.js';

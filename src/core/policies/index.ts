@@ -135,11 +135,72 @@ export interface RepairStrategyConfig {
   temperature?: number;
 }
 
+/** Context for smarter repair strategy selection */
+export interface RepairContext {
+  attemptNumber: number;
+  /** Primary error category from the failing validators */
+  errorCategory?: 'build' | 'lint' | 'type' | 'test' | 'other';
+  /** Number of files involved in the repair */
+  fileCount?: number;
+  /** Number of failures in the previous validation run */
+  previousFailureCount?: number;
+  /** Number of failures in the current validation run */
+  currentFailureCount?: number;
+}
+
 /**
- * Determine the repair strategy based on the attempt number.
- * Each retry uses a materially different approach.
+ * Determine the repair strategy based on attempt number AND error context.
+ * Category-aware: lint errors get different treatment than build errors.
+ * Progress-aware: if failures are decreasing, stay on the current strategy.
  */
-export function getRepairStrategy(attemptNumber: number): RepairStrategyConfig {
+export function getRepairStrategy(attemptNumber: number, ctx?: RepairContext): RepairStrategyConfig {
+  // Progress detection: if the current strategy is reducing failures, repeat it
+  if (ctx && ctx.previousFailureCount !== undefined && ctx.currentFailureCount !== undefined) {
+    if (ctx.currentFailureCount < ctx.previousFailureCount && attemptNumber > 1) {
+      // Current strategy is making progress — repeat instead of escalating
+      return getRepairStrategy(attemptNumber - 1, { ...ctx, previousFailureCount: undefined });
+    }
+  }
+
+  // Category-specific strategy adjustments
+  if (ctx?.errorCategory === 'lint' && attemptNumber <= 2) {
+    // Lint errors are almost always surface-level — stay on local_fix longer
+    return {
+      strategy: 'local_fix',
+      strategyPrompt: `STRATEGY: LOCAL FIX — LINT (Attempt ${attemptNumber})
+This is a lint/formatting error. These are almost always surface-level fixes.
+Read the exact lint error, find the line, and apply a minimal targeted fix.
+Do NOT refactor or redesign — just satisfy the lint rule.
+If the lint rule seems wrong, check if there's an eslint-disable comment or config change needed.`,
+    };
+  }
+
+  if (ctx?.errorCategory === 'build' && attemptNumber === 1) {
+    // Build errors often have upstream causes — go straight to root cause
+    return {
+      strategy: 'root_cause',
+      strategyPrompt: `STRATEGY: ROOT CAUSE — BUILD (Attempt 1)
+Build errors are rarely surface-level. Before patching, analyze:
+1. Is a dependency missing? Check imports and package.json.
+2. Is a type definition wrong? Check the full type chain.
+3. Is a generated file out of date?
+4. Read the full error output — the real cause is often earlier in the log.`,
+      temperature: 0.2,
+    };
+  }
+
+  if (ctx?.errorCategory === 'type' && ctx.fileCount && ctx.fileCount > 5) {
+    // Many-file type errors often need broader analysis from attempt 1
+    return {
+      strategy: 'root_cause',
+      strategyPrompt: `STRATEGY: ROOT CAUSE — TYPE ERRORS (${ctx.fileCount} files)
+Multiple type errors across many files usually indicate a wrong type signature
+or missing type export upstream. Do NOT fix each file individually.
+Find the ROOT type definition that changed and fix it there.
+The individual errors should resolve once the source type is correct.`,
+      temperature: 0.2,
+    };
+  }
   switch (attemptNumber) {
     case 1:
       return {

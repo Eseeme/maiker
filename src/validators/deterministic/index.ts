@@ -12,12 +12,14 @@ export interface DeterministicRunOptions {
   validators: ValidatorName[];
   config: MaikerConfig;
   onOutput?: (line: string) => void;
+  /** Regex pattern to filter which test files to run (for selective reruns) */
+  testPathPattern?: string;
 }
 
 export async function runDeterministicValidators(
   opts: DeterministicRunOptions,
 ): Promise<ValidatorResult[]> {
-  const { runId, projectPath, validators, config, onOutput } = opts;
+  const { runId, projectPath, validators, config, onOutput, testPathPattern } = opts;
   const pm = config.project.packageManager === 'auto'
     ? (await import('../../tools/package/index.js').then(m => m.detectPackageManager(projectPath)))
     : config.project.packageManager as 'npm' | 'yarn' | 'pnpm' | 'bun';
@@ -29,7 +31,7 @@ export async function runDeterministicValidators(
 
     emitValidatorStarted(runId, validator);
 
-    const result = await runSingleValidator(validator, projectPath, pm, onOutput);
+    const result = await runSingleValidator(validator, projectPath, pm, onOutput, testPathPattern);
     results.push(result);
 
     if (result.status === 'passed') {
@@ -50,6 +52,7 @@ async function runSingleValidator(
   cwd: string,
   pm: 'npm' | 'yarn' | 'pnpm' | 'bun' | 'unknown',
   onOutput?: (line: string) => void,
+  testPathPattern?: string,
 ): Promise<ValidatorResult> {
   const start = Date.now();
 
@@ -98,7 +101,7 @@ async function runSingleValidator(
       case 'unit_tests':
       case 'integration_tests':
       case 'regression_tests': {
-        const r = await runTests(cwd, pm, onOutput);
+        const r = await runTests(cwd, pm, onOutput, testPathPattern);
         return {
           name: validator,
           status: r.success ? 'passed' : 'failed',

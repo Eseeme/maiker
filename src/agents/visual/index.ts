@@ -66,6 +66,30 @@ ${input.taskConstraints.map((c) => `- ${c}`).join('\n') || 'None specified'}
 Route metadata:
 ${JSON.stringify(input.routeMetadata, null, 2)}
 
+Browser errors:
+${
+  input.browserErrors && input.browserErrors.length > 0
+    ? input.browserErrors
+        .map(
+          (e) =>
+            `Route: ${e.route}\n  Console errors: ${e.consoleErrors.length > 0 ? e.consoleErrors.join('\n    ') : 'None'}\n  Network errors: ${e.networkErrors.length > 0 ? e.networkErrors.join('\n    ') : 'None'}`,
+        )
+        .join('\n')
+    : 'None captured'
+}
+
+Screenshot diffs (vs baseline):
+${
+  input.screenshotDiffs && input.screenshotDiffs.length > 0
+    ? input.screenshotDiffs
+        .map(
+          (d) =>
+            `${d.file}: ${d.changed ? `CHANGED (${d.diffPercent !== null ? d.diffPercent.toFixed(2) + '%' : 'unknown'} diff)` : 'unchanged'}`,
+        )
+        .join('\n')
+    : 'No baseline comparison available'
+}
+
 Context:
 ${input.context ?? 'None'}
 

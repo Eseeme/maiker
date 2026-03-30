@@ -18,6 +18,7 @@ import {
   guardFileOp,
   guardCommand,
   parseCommand,
+  checkPipelineSafety,
   type SecurityPolicy,
   DEFAULT_SECURITY_POLICY,
 } from '../../core/guards/index.js';
@@ -162,6 +163,12 @@ export async function executeTool(
         const guard = guardCommand(toolInput.command, policy);
         if (!guard.allowed) {
           return { output: `Blocked: ${guard.reason}`, isError: true };
+        }
+
+        // Pipeline decomposition: validate each segment of piped/chained commands
+        const pipelineCheck = checkPipelineSafety(toolInput.command, policy);
+        if (!pipelineCheck.allowed) {
+          return { output: `Blocked: ${pipelineCheck.reason}`, isError: true };
         }
 
         // Policy hook: preCommand (additional command-level policy checks)

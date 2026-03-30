@@ -348,6 +348,8 @@ export interface VisualReviewAgentInput extends AgentInput {
   viewports: string[];
   taskConstraints: string[];
   routeMetadata: Record<string, string>;
+  browserErrors?: Array<{ route: string; consoleErrors: string[]; networkErrors: string[] }>;
+  screenshotDiffs?: Array<{ file: string; changed: boolean; diffPercent: number | null }>;
 }
 
 export interface VisualReviewAgentOutput {

@@ -86,6 +86,14 @@ const BLOCKED_COMMAND_PATTERNS = [
   // Network exfiltration
   /\bcurl\b.*\|\s*sh\b/,            // Pipe curl to shell
   /\bwget\b.*\|\s*sh\b/,            // Pipe wget to shell
+
+  // Dangerous pipe targets (arbitrary code execution from piped input)
+  /\|\s*sh\b/,                       // Pipe to sh
+  /\|\s*bash\b/,                     // Pipe to bash
+  /\|\s*eval\b/,                     // Pipe to eval
+  /\|\s*python\s+-c\b/,             // Pipe to python -c
+  /\|\s*python3\s+-c\b/,            // Pipe to python3 -c
+  /\|\s*node\s+-e\b/,               // Pipe to node -e
   /\bnc\s+-[el]/,                    // Netcat listeners
   /\bscp\b/,                         // Remote copy
   /\brsync\b.*:/,                    // Remote sync
@@ -339,6 +347,67 @@ function parseShellArgs(input: string): string[] {
     args.push(current);
   }
   return args;
+}
+
+// ─── Pipeline Decomposition ─────────────────────────────────────────────────
+
+/** Regex to split commands on pipeline/chain operators: |, &&, ||, ; */
+const PIPELINE_SPLIT_RE = /\s*(?:\|{1,2}|&&|;)\s*/;
+
+/** Metacharacters that trigger sh -c routing in parseCommand */
+const SHELL_META_RE = /[|&;<>`$()]/;
+
+export interface PipelineCheckResult {
+  allowed: boolean;
+  reason?: string;
+  segments: string[];
+}
+
+/**
+ * Decompose a shell command on pipeline/chain operators and validate each
+ * segment independently against the security policy. If ANY segment fails,
+ * the whole pipeline is blocked.
+ *
+ * Call this BEFORE parseCommand for commands that contain shell metacharacters
+ * so that `sh -c` is never handed a pipeline with a disallowed segment.
+ */
+export function checkPipelineSafety(
+  command: string,
+  policy: SecurityPolicy = DEFAULT_SECURITY_POLICY,
+): PipelineCheckResult {
+  const trimmed = command.trim();
+
+  // If the command has no shell metacharacters it is a simple command —
+  // normal checkCommand is sufficient, no decomposition needed.
+  if (!SHELL_META_RE.test(trimmed)) {
+    return { allowed: true, segments: [trimmed] };
+  }
+
+  // First, run the full command through the blocked-patterns check
+  // (catches patterns like `curl ... | sh` that span segments).
+  const fullCheck = checkCommand(trimmed, policy);
+  if (!fullCheck.allowed) {
+    return { allowed: false, reason: fullCheck.reason, segments: [trimmed] };
+  }
+
+  // Split into individual segments and validate each one
+  const segments = trimmed
+    .split(PIPELINE_SPLIT_RE)
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  for (const segment of segments) {
+    const result = checkCommand(segment, policy);
+    if (!result.allowed) {
+      return {
+        allowed: false,
+        reason: `Pipeline segment blocked: "${segment}" — ${result.reason}`,
+        segments,
+      };
+    }
+  }
+
+  return { allowed: true, segments };
 }
 
 // ─── Convenience: Full guard check for tool execution ────────────────────────

@@ -8,6 +8,7 @@ import type {
 } from '../../types/index.js';
 import { runDeterministicValidators } from '../deterministic/index.js';
 import { runVisualValidation } from '../visual/index.js';
+import { resolveAffectedTests, buildTestPattern } from '../test-mapping.js';
 
 export interface ValidationEngineOptions {
   runId: string;
@@ -21,6 +22,8 @@ export interface ValidationEngineOptions {
   onlyValidators?: ValidatorName[];
   /** Previous validation results — used to skip passing validators on rerun */
   previousResults?: FullValidationResult;
+  /** Changed files since last validation — used for selective test reruns */
+  changedFiles?: string[];
 }
 
 export interface FullValidationResult {
@@ -151,6 +154,18 @@ export async function runFullValidation(
     onOutput(`Skipping due to failed dependencies: ${skippedDueToDeps.join(', ')}`);
   }
 
+  // ── Resolve affected test files for selective test reruns ─────────────
+  let testPathPattern: string | undefined;
+  if (opts.changedFiles && opts.changedFiles.length > 0) {
+    const affectedTests = resolveAffectedTests(opts.changedFiles, projectPath);
+    if (affectedTests.length > 0) {
+      testPathPattern = buildTestPattern(affectedTests) ?? undefined;
+      if (onOutput) {
+        onOutput(`Affected tests: ${affectedTests.length} file(s) — ${affectedTests.slice(0, 3).join(', ')}${affectedTests.length > 3 ? '...' : ''}`);
+      }
+    }
+  }
+
   // ── Run deterministic validators ────────────────────────────────────────
   const deterministicResults = await runDeterministicValidators({
     runId,
@@ -158,6 +173,7 @@ export async function runFullValidation(
     validators: ordered,
     config,
     onOutput,
+    testPathPattern,
   });
 
   // Add skipped-due-to-deps results

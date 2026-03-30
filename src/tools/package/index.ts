@@ -118,6 +118,23 @@ export async function runTests(
   cwd: string,
   pm: PackageManager,
   onOutput?: (line: string) => void,
+  testPathPattern?: string,
 ): Promise<{ success: boolean; output: string; duration: number }> {
+  if (testPathPattern) {
+    // Selective test rerun: pass pattern to the test runner
+    // Works with jest, vitest, and most test runners that accept -- args
+    const cmd = getPmCommand(pm);
+    const result = await spawnCommand(cmd, ['run', 'test', '--', '--testPathPattern', testPathPattern], {
+      cwd,
+      onStdout: onOutput,
+      onStderr: onOutput,
+      timeout: 300_000,
+    });
+    return {
+      success: result.exitCode === 0,
+      output: result.stdout + result.stderr,
+      duration: result.duration,
+    };
+  }
   return runScript(cwd, pm, 'test', onOutput);
 }

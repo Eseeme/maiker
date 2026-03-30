@@ -175,6 +175,8 @@ export async function runVisualValidation(
           routeMetadata: Object.fromEntries(
             config.playwright.routes.map((r) => [r, r]),
           ),
+          browserErrors,
+          screenshotDiffs,
         },
         config,
       );

@@ -212,29 +212,55 @@ function computeExecutionWaves(subtasks: Subtask[]): Subtask[][] {
   return waves;
 }
 
+/**
+ * Detect file-level conflicts between subtasks (synchronous — exact overlap only).
+ * For import-level conflicts, use detectImportConflicts() which is async.
+ */
 function detectFileConflicts(wave: Subtask[]): Array<[string, string]> {
   const conflicts: Array<[string, string]> = [];
   for (let i = 0; i < wave.length; i++) {
     for (let j = i + 1; j < wave.length; j++) {
-      // Direct file overlap
       const shared = wave[i].fileTargets.filter(f => wave[j].fileTargets.includes(f));
       if (shared.length > 0) {
         conflicts.push([wave[i].id, wave[j].id]);
-        continue;
-      }
-      // Semantic proximity: if both subtasks target files in the same directory,
-      // they're likely touching related modules (shared imports, types, etc.)
-      const dirsI = new Set(wave[i].fileTargets.map(f => f.split('/').slice(0, -1).join('/')));
-      const dirsJ = new Set(wave[j].fileTargets.map(f => f.split('/').slice(0, -1).join('/')));
-      for (const dir of dirsI) {
-        if (dir && dirsJ.has(dir)) {
-          conflicts.push([wave[i].id, wave[j].id]);
-          break;
-        }
       }
     }
   }
   return conflicts;
+}
+
+import { findImportConflicts } from './import-graph.js';
+
+/**
+ * Detect all conflicts: file overlap + import-level dependencies.
+ * Import analysis reads actual source files to find shared imports between subtasks.
+ */
+async function detectAllConflicts(
+  wave: Subtask[],
+  projectPath: string,
+): Promise<Array<[string, string]>> {
+  // Fast path: exact file overlap (synchronous)
+  const fileConflicts = detectFileConflicts(wave);
+
+  // Import-level conflicts (async — reads source files)
+  let importConflicts: Array<[string, string]> = [];
+  try {
+    importConflicts = await findImportConflicts(wave, projectPath);
+  } catch (err) {
+    console.warn(`[maiker] Import graph analysis failed, using file-only conflicts: ${String(err)}`);
+  }
+
+  // Merge and deduplicate
+  const seen = new Set<string>();
+  const all: Array<[string, string]> = [];
+  for (const pair of [...fileConflicts, ...importConflicts]) {
+    const key = pair.sort().join(':');
+    if (!seen.has(key)) {
+      seen.add(key);
+      all.push(pair);
+    }
+  }
+  return all;
 }
 
 /**
@@ -518,7 +544,7 @@ async function nodeExecute(state: GraphState): Promise<Partial<GraphState>> {
 
   // Execute wave by wave
   for (const wave of waves) {
-    const conflicts = detectFileConflicts(wave);
+    const conflicts = await detectAllConflicts(wave, state.projectPath);
     // With worktrees: parallel is safe even with conflicts (isolated directories)
     // Without worktrees: conflicts force sequential execution
     const canParallelize = useWorktrees || conflicts.length === 0;
@@ -1068,8 +1094,22 @@ async function nodeRepair(state: GraphState): Promise<Partial<GraphState>> {
   emitRepairStarted(state.runId, runRetry);
   await setAgent(state.runId, 'repair', `Applying repair (attempt ${runRetry})`);
 
-  // Determine strategy for structured history
-  const strategyConfig = getRepairStrategy(runRetry);
+  // Build repair context for strategy selection
+  const primaryCategory = openIssues.length > 0 ? openIssues[0].category : 'other';
+  const currentFailureCount = state.validationResults.length > 0
+    ? state.validationResults[state.validationResults.length - 1].results.filter(r => r.status === 'failed').length
+    : undefined;
+  const previousFailureCount = state.validationResults.length > 1
+    ? state.validationResults[state.validationResults.length - 2].results.filter(r => r.status === 'failed').length
+    : undefined;
+
+  const strategyConfig = getRepairStrategy(runRetry, {
+    attemptNumber: runRetry,
+    errorCategory: primaryCategory as 'build' | 'lint' | 'type' | 'test' | 'other',
+    fileCount: (state.sharedContext?.changedFiles ?? []).length,
+    previousFailureCount,
+    currentFailureCount,
+  });
 
   try {
     emitAgentInvoked(state.runId, 'repair', state.config.models.repairAgent.model);
